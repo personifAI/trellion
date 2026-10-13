@@ -1,0 +1,268 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: CI
+
+# Tests, lint, licence headers, a database-backed run and an import smoke test.
+
+on:
+  push:
+    branches: [ main, dev, staging ]
+  pull_request:
+    branches: [ main, dev, staging ]
+  # Lets a run that never started be re-triggered without a new commit.
+  workflow_dispatch:
+
+jobs:
+  # Docker Hub limits pulls per IP, so the postgres service image comes from
+  # the org's GHCR mirror when one exists. A service image is pulled at job SETUP,
+  # where nothing can fall back, so this job decides first: the mirror when it
+  # is readable ANONYMOUSLY (the package is public), else Docker Hub with a
+  # warning. Anonymous because `services.credentials` cannot be conditional
+  # (an empty value is a template error), and the same credentials cannot
+  # serve both registries. Repo variable HUB_MIRROR moves the prefix;
+  # HUB_MIRROR_OFF=1 forces Docker Hub.
+  pg-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.pick.outputs.image }}
+      mirrored: ${{ steps.pick.outputs.mirrored }}
+    steps:
+      - id: pick
+        env:
+          HUB_MIRROR: ${{ vars.HUB_MIRROR || format('ghcr.io/{0}/mirror', github.repository_owner) }}
+          HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+        run: |
+          hub=pgvector/pgvector:pg16
+          mirror="$HUB_MIRROR/$hub"
+          # An empty credential store: the check must see what the service pull will.
+          export DOCKER_CONFIG="$RUNNER_TEMP/anon-docker"; mkdir -p "$DOCKER_CONFIG"
+          if [ -z "${HUB_MIRROR_OFF:-}" ] && docker buildx imagetools inspect "$mirror" >/dev/null 2>&1; then
+            echo "postgres service: $mirror"
+            { echo "image=$mirror"; echo "mirrored=true"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::$mirror is not readable from this repo (not mirrored yet, not public, or HUB_MIRROR_OFF) — postgres service from Docker Hub"
+            { echo "image=$hub"; echo "mirrored=false"; } >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      # persist-credentials: false keeps the checkout token out of git config.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # `clustering` is included deliberately. tests/test_cluster.py guards on
+      # `importorskip("leidenalg")`, so without the extra the whole module
+      # SKIPS and the suite still reports green — which is exactly what
+      # happened once: the cluster tests collapsed into a single skip. An optional
+      # dependency that is never installed anywhere is an untested code path
+      # wearing a passing badge.
+      #
+      # Safe to install unconditionally now: leidenalg and igraph ship abi3
+      # wheels and pull no numpy, so this costs a couple of seconds on every
+      # interpreter including 3.13.
+      # trellion depends on trellion-protocols, pinned by commit. It is public,
+      # so no credential is involved; this fails loudly if the pin stops
+      # resolving rather than letting the install error later.
+      - name: The trellion-protocols pin is reachable
+        run: bash scripts/check-protocols-access.sh
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,clustering]" || pip install -e .
+          pip install pytest pytest-asyncio
+
+      - name: Test
+        run: pytest tests/ -q
+
+      # Guards the above. If the extra silently stops installing, the cluster
+      # tests go back to skipping and nothing else notices.
+      - name: Cluster tests actually ran
+        run: |
+          python -c "import leidenalg, igraph" || {
+            echo "::error::clustering extra not installed — cluster tests would skip"; exit 1; }
+          pytest tests/test_cluster.py -q --no-header | tail -1
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      # persist-credentials: false keeps the checkout token out of git config.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Ruff is PINNED and the rule set is passed EXPLICITLY on the command
+      # line rather than read from pyproject.
+      #
+      # Both halves matter. An unpinned ruff can expand its DEFAULT selection
+      # between releases and turn CI red with no code change. Pinning the version
+      # stops the tool moving under us; naming the rules stops a config edit
+      # from changing what CI enforces without anyone noticing.
+      - name: Install ruff (pinned)
+        run: pip install ruff==0.15.21
+
+      # E4 imports / E7 statements / E9 syntax+runtime / F pyflakes.
+      #
+      # This is the CORRECTNESS subset, not the project's full declared style
+      # (pyproject also selects I, UP, B, W, N). Those add ~660 further
+      # findings — overwhelmingly `Optional[X]` -> `X | None` modernisation —
+      # and fixing them is a repo-wide reformat that does not belong in the
+      # change that turns CI on. Gate on what catches bugs now; tighten later.
+      #
+      # F is the one that earns its place: it catches undefined names, which
+      # `python -m py_compile` does NOT. A NameError in a rarely-taken branch
+      # compiles perfectly and fails in production.
+      - name: Lint (correctness rules)
+        run: ruff check --select E4,E7,E9,F src/
+
+      # Licence headers cannot rot: every source file carries its SPDX line
+      # (AGPL-3.0-only). To add headers run `python scripts/spdx.py . AGPL-3.0-only`.
+      - name: SPDX licence headers present
+        run: python scripts/spdx.py . AGPL-3.0-only --check
+
+  db-test:
+    # The unit tests check the attribution POLICY; these check it reaches
+    # Postgres. A filter can read correctly and behave correctly in isolation
+    # and still match zero rows on the real schema; only a real database shows that.
+    runs-on: ubuntu-latest
+    needs: [pg-image]
+    services:
+      postgres:
+        # pgvector, not stock postgres: the memory baseline creates vector()
+        # columns and plain postgres fails the migration outright.
+        image: ${{ needs.pg-image.outputs.image }}
+        env:
+          POSTGRES_USER: noo
+          POSTGRES_PASSWORD: testpw
+          POSTGRES_DB: noomesh
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U noo"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      # persist-credentials: false keeps the checkout token out of git config.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # trellion depends on trellion-protocols, pinned by commit. It is public,
+      # so no credential is involved; this fails loudly if the pin stops
+      # resolving rather than letting the install error later.
+      - name: The trellion-protocols pin is reachable
+        run: bash scripts/check-protocols-access.sh
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" || pip install -e .
+          pip install pytest pytest-asyncio asyncpg alembic
+
+      # Build the schema from trellion's own migrations rather than a fixture.
+      # A hand-written fixture drifts from the migrations and then tests a
+      # schema that no deployment actually has.
+      # The env VERIFIES extensions now, it does not create them — creating
+      # needs superuser (both are untrusted), and shedding that requirement
+      # is what lets the chain run as a non-superuser DDL role. In
+      # a cluster the broker installs them; here that job falls to this step.
+      - name: Install extensions (the broker's job, done by hand in CI)
+        env:
+          PGPASSWORD: testpw
+        run: |
+          psql -h localhost -U noo -d noomesh \
+            -c "CREATE EXTENSION IF NOT EXISTS vector" \
+            -c "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+
+      # Role provisioning is not done by this env. No password needed:
+      # this run creates SCHEMA, never roles.
+      - name: Migrate
+        env:
+          DATABASE_URL: postgresql://noo:testpw@localhost:5432/noomesh
+        run: alembic -c src/trellion/db/alembic.ini upgrade heads
+
+      # Runs the WHOLE suite with the DSN set, not a -k "db" subset. Substring
+      # selection silently misses any DB test added to another file later, and
+      # a test that never runs looks exactly like a test that passes. The
+      # skipif on TRELLION_TEST_DSN already gates the DB-only cases.
+      - name: Test against Postgres
+        env:
+          TRELLION_TEST_DSN: postgresql+asyncpg://noo:testpw@localhost:5432/noomesh
+        run: pytest tests/ -q
+
+  import-smoke:
+    # Catches the failure py_compile and unit tests both miss: a module that
+    # parses and is never imported by a test, but explodes at import time in
+    # a deployed container, where an import error is a broken service, not a
+    # broken library.
+    runs-on: ubuntu-latest
+    steps:
+      # persist-credentials: false keeps the checkout token out of git config.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # trellion depends on trellion-protocols, pinned by commit. It is public,
+      # so no credential is involved; this fails loudly if the pin stops
+      # resolving rather than letting the install error later.
+      - name: The trellion-protocols pin is reachable
+        run: bash scripts/check-protocols-access.sh
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" || pip install -e .
+      - name: Import every module
+        run: |
+          python - <<'PY'
+          import importlib, pkgutil, sys
+          import trellion
+
+          # Alembic's env.py is only importable inside `alembic` itself — it
+          # reads `alembic.context`, which does not exist until Alembic sets it
+          # up. Importing it standalone raises AttributeError by design, so it
+          # is excluded rather than "fixed". The migration files themselves are
+          # covered by the migration-replay check, not by this smoke test.
+          SKIP = ("trellion.db.migrations.env",)
+
+          failed = []
+          for mod in pkgutil.walk_packages(trellion.__path__, "trellion."):
+              if mod.name in SKIP:
+                  continue
+              try:
+                  importlib.import_module(mod.name)
+              except Exception as e:
+                  # Optional heavy deps (torch, etc.) are legitimately absent on
+                  # a CI runner; a missing optional dependency is not a defect.
+                  if isinstance(e, ImportError) and "No module named" in str(e):
+                      print(f"skip (optional dep): {mod.name}: {e}")
+                      continue
+                  failed.append((mod.name, repr(e)))
+
+          for name, err in failed:
+              print(f"FAILED {name}: {err}", file=sys.stderr)
+          sys.exit(1 if failed else 0)
+          PY

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Default build config. Copy and edit per domain.
+
+input_dir: data/sample/docs
+output_dir: out/sample
+
+llm:
+  base_url: http://localhost:8000/v1
+  api_key: not-needed-for-local
+  model: local-llm
+  temperature: 0.0
+  max_tokens: 2048
+  max_concurrent: 32
+
+embed:
+  base_url: http://localhost:8080/v1
+  model: bge-large-en-v1.5
+  batch_size: 64
+  max_concurrent: 16
+
+chunking:
+  target_tokens: 512
+  overlap_tokens: 64
+
+extraction:
+  entity_types: [CONCEPT, ENTITY, EVENT, PROCESS]
+  relation_types: [PREREQ, CONTAINS, CAUSES, RELATED_TO]
+  max_gleanings: 1
+  prompt_version: v1
+
+canonicalization:
+  similarity_threshold: 0.88
+  perturbation_sigma: 0.02
+  perturbation_trials: 8
+  consensus_fraction: 0.625
+  knn_k: 5
+
+cluster:
+  algorithm: leiden
+  max_cluster_size: 20
+  seed: 42
+  use_lcc: true
+
+dag:
+  priority_relations: [PREREQ, CONTAINS, CAUSES]
+  cycle_break_strategy: eades

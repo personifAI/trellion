@@ -1,0 +1,14 @@
+{"id": "t1_function", "type": "T1", "query": "What is Function?", "expected_concept_ids": [1]}
+{"id": "t1_deriv", "type": "T1", "query": "What is Derivative?", "expected_concept_ids": [1, 4, 6]}
+{"id": "t2_composite", "type": "T2", "query": "What are the prerequisites for Composite Function?", "expected_concept_ids": [1, 3]}
+{"id": "t2_inverse", "type": "T2", "query": "What does Inverse Function depend on?", "expected_concept_ids": [1, 2, 3]}
+{"id": "t2_chain", "type": "T2", "query": "What are the prerequisites for Chain Rule?", "expected_concept_ids": [4, 6]}
+{"id": "t2_taylor", "type": "T2", "query": "What are the prerequisites for Taylor Series?", "expected_concept_ids": [6, 7]}
+{"id": "t3_fn_taylor", "type": "T3", "query": "What is the chain from Function to Taylor Series?", "expected_concept_ids": [1, 6, 8], "expected_path": [1, 6, 8]}
+{"id": "t3_rev_taylor_fn", "type": "T3", "query": "What is the chain from Taylor Series to Function?", "expected_concept_ids": [8, 6, 1], "expected_path": [8, 6, 1]}
+{"id": "t3_deriv_chain", "type": "T3", "query": "What is the path from Derivative to Chain Rule?", "expected_concept_ids": [6, 7], "expected_path": [6, 7]}
+{"id": "t4_found", "type": "T4", "query": "List all FOUND concepts", "expected_concept_ids": [1, 2, 3]}
+{"id": "t4_core", "type": "T4", "query": "List all CORE concepts", "expected_concept_ids": [4, 5]}
+{"id": "t4_adv", "type": "T4", "query": "List all ADV concepts", "expected_concept_ids": [6, 7, 8]}
+{"id": "t5_domain_inverse", "type": "T5", "query": "How does Domain and Range relate to Inverse Function?", "expected_concept_ids": [2, 5, 1]}
+{"id": "t5_comp_deriv", "type": "T5", "query": "How does Composite Function connect to Derivative?", "expected_concept_ids": [4, 6, 1]}

@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Research prototype only (the offline build/query CKG pipeline under
+# src/trellion/build and src/trellion/query). The shipped noo-trellion
+# container (src/trellion/live) does not use this compose file or dial
+# vLLM/TEI directly — it goes through the noomesh gateway. See README.md.
+#
+# Local inference stack: vLLM for generation, TEI for embeddings.
+# Both expose OpenAI-compatible HTTP APIs so clients can swap cloud <-> local
+# by changing only the base URL.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up
+#
+# GPU assumed. If you're CPU-only, replace the images with small CPU variants
+# (e.g. `ghcr.io/huggingface/text-embeddings-inference:cpu-latest`) and drop
+# the `deploy.resources.reservations.devices` blocks.
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: ckg-vllm
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    ipc: host
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      --model ${VLLM_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}
+      --served-model-name local-llm
+      --max-model-len 8192
+      --gpu-memory-utilization 0.85
+      --enable-prefix-caching
+      --dtype auto
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:latest
+    container_name: ckg-tei
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ${HOME}/.cache/huggingface:/data
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      --model-id ${TEI_MODEL:-BAAI/bge-large-en-v1.5}
+      --max-concurrent-requests 512
+      --max-batch-tokens 16384
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

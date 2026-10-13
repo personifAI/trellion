@@ -1,0 +1,350 @@
+{
+  "comment": "Live-path retrieval benchmark corpus A fictional multi-site plant KB. The graph is HAND-AUTHORED ground truth so the benchmark isolates retrieval policy from extraction quality. Two hardness mechanisms: relational golden queries are lexically disjoint from their answer docs (defeats token-overlap retrieval), and each has a SEMANTIC DISTRACTOR - a doc that matches the query's surface form BETTER than the true answer but belongs to different equipment, linked only through the graph. A semantic embedder ranks distractors above answers; only traversal from the named equipment disambiguates. That is the claim of graph-guided retrieval, stated as a fixture.",
+  "docs": [
+    {
+      "source_uri": "bench://plant/overview",
+      "title": "Aurora Plant Overview",
+      "pages": [
+        "The Aurora plant runs three production lines feeding a shared packaging cell. The line-3 conveyor moves formed product from the ovens to the packaging cell. Throughput targets are set per shift and tracked on the floor dashboard."
+      ]
+    },
+    {
+      "source_uri": "bench://plant/drive-assembly",
+      "title": "Drive Assembly Maintenance",
+      "pages": [
+        "The drive assembly couples the motor to the gearbox through a splined shaft. Lubrication of the gearbox and the shaft bearing seats follows a 500-hour schedule. Torque on the coupling bolts is checked quarterly with a calibrated wrench."
+      ]
+    },
+    {
+      "source_uri": "bench://plant/bearing-fatigue",
+      "title": "Bearing Fatigue Analysis",
+      "pages": [
+        "Rolling-element wear progresses from micro-pitting to spalling of the raceway. Early-stage degradation shows as a rising envelope signature well before audible noise. Lubricant film breakdown under sustained load accelerates raceway damage and shortens component life."
+      ]
+    },
+    {
+      "source_uri": "bench://plant/vibration-monitoring",
+      "title": "Vibration Monitoring Procedure",
+      "pages": [
+        "Accelerometers are mounted at each bearing housing and sampled hourly. The FFT bands are compared against alarm thresholds per ISO class; a breach opens a work order automatically. Trend data feeds the predictive program's weekly review."
+      ]
+    },
+    {
+      "source_uri": "bench://plant/coolant-system",
+      "title": "Coolant System",
+      "pages": [
+        "The coolant system circulates a glycol mix through the process heat exchanger. Pump P-7 provides primary circulation; a standby unit cuts in on differential-pressure loss. Glycol concentration is titrated monthly."
+      ]
+    },
+    {
+      "source_uri": "bench://plant/pump-p7-report",
+      "title": "Pump P-7 Seal Report",
+      "pages": [
+        "The mechanical seal on P-7 failed after cavitation damage scored the seal faces. The leak released roughly forty litres of working fluid to the bund. Root cause traced to suction-side restriction from a partially closed isolation valve."
+      ]
+    },
+    {
+      "source_uri": "bench://plant/packaging-cell",
+      "title": "Packaging Cell Operations",
+      "pages": [
+        "The packaging cell wraps finished product in film and applies shipment labels via the label applicator. Two delta robots handle case loading. Film tension and applicator alignment are checked at shift start."
+      ]
+    },
+    {
+      "source_uri": "bench://plant/label-adhesive",
+      "title": "Label Adhesive Specification",
+      "pages": [
+        "The adhesive cures fully at 18-24 C and loses tack above 60 percent relative humidity. Store rolls in the climate cabinet and discard stock older than six months. Substrate must be wiped free of oil before application."
+      ]
+    },
+    {
+      "source_uri": "bench://delta-site/belt-delamination",
+      "title": "Belt Delamination Study (Delta Site)",
+      "pages": [
+        "The delta-site conveyor breaks down repeatedly when the carry belt delaminates at the splice. Ply separation starts at the edge and propagates under load. Replacing the splice with a vulcanised joint stopped the recurring conveyor breakdowns at delta."
+      ]
+    },
+    {
+      "source_uri": "bench://mixer/gear-tooth-wear",
+      "title": "Mixer Gearbox Tooth Wear Note",
+      "pages": [
+        "The mixer gearbox shows classic tooth flank wear and pitting. Drive vibration rises when worn teeth mesh. This failure mode is confined to the mixer drivetrain and is corrected by gear set replacement."
+      ]
+    },
+    {
+      "source_uri": "bench://hvac/chiller-loop-failures",
+      "title": "Chiller Loop Failure Log",
+      "pages": [
+        "The HVAC chiller loop has gone wrong twice this year: a compressor tripped on high head pressure, and the loop lost charge through a corroded brazed joint. Both cooling system faults were repaired by the refrigeration contractor."
+      ]
+    },
+    {
+      "source_uri": "bench://warehouse/carton-glue-failures",
+      "title": "Carton Glue Failure Note",
+      "pages": [
+        "Warehouse carton labelling keeps failing: the glue on shipping cartons lets go in cold storage and labels fall off pallets. Storage rules for the warehouse glue sticks were tightened after the audit."
+      ]
+    },
+    {
+      "source_uri": "bench://mixer/oil-analysis",
+      "title": "Oil Analysis Program (Mixer)",
+      "pages": [
+        "Oil analysis detects trouble in the mixer drive early: iron and chromium counts trend up weeks before damage is audible. Samples are drawn monthly from the mixer gearbox sump."
+      ]
+    }
+  ],
+  "entities": [
+    {
+      "name": "Line-3 Conveyor",
+      "type": "EQUIPMENT",
+      "aliases": [
+        "conveyor"
+      ]
+    },
+    {
+      "name": "Drive Assembly",
+      "type": "COMPONENT",
+      "aliases": [
+        "drive"
+      ]
+    },
+    {
+      "name": "Bearing Fatigue",
+      "type": "FAILURE_MODE",
+      "aliases": []
+    },
+    {
+      "name": "Vibration Monitoring",
+      "type": "PROCEDURE",
+      "aliases": []
+    },
+    {
+      "name": "Coolant System",
+      "type": "SYSTEM",
+      "aliases": []
+    },
+    {
+      "name": "Pump P-7",
+      "type": "EQUIPMENT",
+      "aliases": [
+        "p-7"
+      ]
+    },
+    {
+      "name": "Seal Failure",
+      "type": "FAILURE_MODE",
+      "aliases": []
+    },
+    {
+      "name": "Packaging Cell",
+      "type": "AREA",
+      "aliases": []
+    },
+    {
+      "name": "Label Applicator",
+      "type": "EQUIPMENT",
+      "aliases": []
+    },
+    {
+      "name": "Adhesive Specification",
+      "type": "DOCUMENT",
+      "aliases": []
+    },
+    {
+      "name": "Delta Belt Line",
+      "type": "EQUIPMENT",
+      "aliases": []
+    },
+    {
+      "name": "Belt Delamination",
+      "type": "FAILURE_MODE",
+      "aliases": []
+    },
+    {
+      "name": "Mixer Gearbox",
+      "type": "EQUIPMENT",
+      "aliases": [
+        "mixer"
+      ]
+    },
+    {
+      "name": "Gear Tooth Wear",
+      "type": "FAILURE_MODE",
+      "aliases": []
+    },
+    {
+      "name": "Chiller Loop",
+      "type": "SYSTEM",
+      "aliases": []
+    },
+    {
+      "name": "Carton Glue",
+      "type": "MATERIAL",
+      "aliases": []
+    },
+    {
+      "name": "Oil Analysis",
+      "type": "PROCEDURE",
+      "aliases": []
+    }
+  ],
+  "mentions": [
+    {
+      "entity": "Line-3 Conveyor",
+      "doc": "bench://plant/overview",
+      "page_no": 1
+    },
+    {
+      "entity": "Packaging Cell",
+      "doc": "bench://plant/overview",
+      "page_no": 1
+    },
+    {
+      "entity": "Drive Assembly",
+      "doc": "bench://plant/drive-assembly",
+      "page_no": 1
+    },
+    {
+      "entity": "Bearing Fatigue",
+      "doc": "bench://plant/bearing-fatigue",
+      "page_no": 1
+    },
+    {
+      "entity": "Vibration Monitoring",
+      "doc": "bench://plant/vibration-monitoring",
+      "page_no": 1
+    },
+    {
+      "entity": "Coolant System",
+      "doc": "bench://plant/coolant-system",
+      "page_no": 1
+    },
+    {
+      "entity": "Pump P-7",
+      "doc": "bench://plant/coolant-system",
+      "page_no": 1
+    },
+    {
+      "entity": "Pump P-7",
+      "doc": "bench://plant/pump-p7-report",
+      "page_no": 1
+    },
+    {
+      "entity": "Seal Failure",
+      "doc": "bench://plant/pump-p7-report",
+      "page_no": 1
+    },
+    {
+      "entity": "Packaging Cell",
+      "doc": "bench://plant/packaging-cell",
+      "page_no": 1
+    },
+    {
+      "entity": "Label Applicator",
+      "doc": "bench://plant/packaging-cell",
+      "page_no": 1
+    },
+    {
+      "entity": "Adhesive Specification",
+      "doc": "bench://plant/label-adhesive",
+      "page_no": 1
+    },
+    {
+      "entity": "Delta Belt Line",
+      "doc": "bench://delta-site/belt-delamination",
+      "page_no": 1
+    },
+    {
+      "entity": "Belt Delamination",
+      "doc": "bench://delta-site/belt-delamination",
+      "page_no": 1
+    },
+    {
+      "entity": "Mixer Gearbox",
+      "doc": "bench://mixer/gear-tooth-wear",
+      "page_no": 1
+    },
+    {
+      "entity": "Gear Tooth Wear",
+      "doc": "bench://mixer/gear-tooth-wear",
+      "page_no": 1
+    },
+    {
+      "entity": "Chiller Loop",
+      "doc": "bench://hvac/chiller-loop-failures",
+      "page_no": 1
+    },
+    {
+      "entity": "Carton Glue",
+      "doc": "bench://warehouse/carton-glue-failures",
+      "page_no": 1
+    },
+    {
+      "entity": "Oil Analysis",
+      "doc": "bench://mixer/oil-analysis",
+      "page_no": 1
+    },
+    {
+      "entity": "Mixer Gearbox",
+      "doc": "bench://mixer/oil-analysis",
+      "page_no": 1
+    }
+  ],
+  "edges": [
+    {
+      "src": "Line-3 Conveyor",
+      "rel": "CONTAINS",
+      "dst": "Drive Assembly"
+    },
+    {
+      "src": "Drive Assembly",
+      "rel": "AFFECTED_BY",
+      "dst": "Bearing Fatigue"
+    },
+    {
+      "src": "Bearing Fatigue",
+      "rel": "DETECTED_BY",
+      "dst": "Vibration Monitoring"
+    },
+    {
+      "src": "Coolant System",
+      "rel": "CONTAINS",
+      "dst": "Pump P-7"
+    },
+    {
+      "src": "Pump P-7",
+      "rel": "AFFECTED_BY",
+      "dst": "Seal Failure"
+    },
+    {
+      "src": "Packaging Cell",
+      "rel": "CONTAINS",
+      "dst": "Label Applicator"
+    },
+    {
+      "src": "Label Applicator",
+      "rel": "GOVERNED_BY",
+      "dst": "Adhesive Specification"
+    },
+    {
+      "src": "Delta Belt Line",
+      "rel": "AFFECTED_BY",
+      "dst": "Belt Delamination"
+    },
+    {
+      "src": "Mixer Gearbox",
+      "rel": "AFFECTED_BY",
+      "dst": "Gear Tooth Wear"
+    },
+    {
+      "src": "Gear Tooth Wear",
+      "rel": "DETECTED_BY",
+      "dst": "Oil Analysis"
+    },
+    {
+      "src": "Chiller Loop",
+      "rel": "AFFECTED_BY",
+      "dst": "Seal Failure"
+    }
+  ]
+}

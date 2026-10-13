@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+[project]
+name = "trellion"
+version = "0.0.2"
+description = "Cognitive substrate: bi-temporal KG, conversation extraction, PageIndex KB, snapshot consolidation. Built for noomesh, shareable across agents."
+requires-python = ">=3.11"
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+
+dependencies = [
+    # The interface trellion offers add-ons (Apache-2.0, its own repo). Pinned
+    # by full commit SHA, never by tag alone: tags can be moved.
+    # v0.1.0
+    "trellion-protocols @ git+https://github.com/personifAI/trellion-protocols.git@2854dad7874696720c10e711288011d478de2280",
+    # I/O + orchestration
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "structlog>=24.0",
+    "orjson>=3.9",
+    # LLM + embedding clients (OpenAI-compatible, works with vLLM + TEI)
+    "openai>=1.40",
+    "httpx>=0.27",
+    "tenacity>=9.0",
+    # Data + graph
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "networkx>=3.3",
+    # Required by core graph utilities.
+    "scipy>=1.11",
+    # Classical NLP
+    "spacy>=3.7",
+    # Live memory subsystem (extracted from noomesh.memory in v0.0.2)
+    "sqlalchemy[asyncio]>=2.0",
+    "psycopg[binary]>=3.1",
+    "pgvector>=0.3",
+    "alembic>=1.13",
+]
+
+[project.optional-dependencies]
+# Hierarchical Leiden. This was graspologic, which pins numpy>=1.26.4,<2.0.0 in
+# EVERY published release — a window holding exactly one numpy version, which
+# predates Python 3.13 and has no wheel for it. Every 3.13 install compiled
+# numpy from source, and that is what broke CI's 3.13 leg (missing Python.h).
+# graspologic-native, its successor, publishes cp39-only wheels with no abi3,
+# so it would only have traded a numpy source build for a Rust one.
+#
+# leidenalg and igraph both ship abi3 wheels (cp38-abi3 / cp39-abi3): they
+# install on 3.13 with no compiler, and neither depends on numpy. Neither has a
+# hierarchical mode, so trellion/build/cluster.py writes the recursive split by
+# hand — see the module docstring.
+#
+# Still an extra, not a core dep: cluster.py imports these lazily and raises a
+# pointer to this extra when they are absent.
+clustering = [
+    "leidenalg>=0.10",  # pulls igraph itself; pinned <2.0 upstream
+    "igraph>=0.11",
+]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    # Required by the database-backed tests (TRELLION_TEST_DSN). Without it they
+    # ERROR importing the asyncpg dialect rather than skipping cleanly, which
+    # reads as a broken suite instead of an absent database.
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "ruff>=0.5",
+    "mypy>=1.11",
+]
+rag = [
+    "pymupdf>=1.23",
+    "markitdown[all]>=0.1",
+]
+video = [
+    # System 1 fast recall — Postgres + FAISS, no MP4
+    "faiss-cpu>=1.7.4",
+]
+graph-igraph = [
+    "python-igraph>=0.11",
+]
+transport = [
+    # Parquet shard packaging (proposal 06 phase 6.C)
+    "pyarrow>=15.0",
+]
+all = [
+    "trellion[clustering,rag,video,graph-igraph,transport]",
+]
+
+[project.urls]
+Homepage = "https://github.com/personifAI/trellion"
+Repository = "https://github.com/personifAI/trellion"
+Issues = "https://github.com/personifAI/trellion/issues"
+
+[project.scripts]
+trellion = "trellion.cli:app"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trellion"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W", "N"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

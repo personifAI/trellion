@@ -1,0 +1,9 @@
+ConceptID,ConceptLabel,Dependencies,TaxonomyID,RelationType,SourceChunks
+1,Function,,FOUND,PREREQ,doc1_c0|doc1_c1
+2,Domain and Range,1,FOUND,PREREQ,doc1_c2
+3,Function Notation,1,FOUND,PREREQ,doc1_c1
+4,Composite Function,1|3,CORE,PREREQ,doc2_c0
+5,Inverse Function,1|2|3,CORE,PREREQ,doc2_c1
+6,Derivative,1|4,ADV,PREREQ,doc3_c0
+7,Chain Rule,4|6,ADV,PREREQ,doc3_c1
+8,Taylor Series,6|7,ADV,PREREQ,doc3_c2

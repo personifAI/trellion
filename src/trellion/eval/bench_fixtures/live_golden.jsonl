@@ -1,0 +1,8 @@
+{"id": "d1", "type": "direct", "query": "vibration monitoring alarm thresholds FFT", "expected_docs": ["bench://plant/vibration-monitoring"]}
+{"id": "d2", "type": "direct", "query": "glycol heat exchanger circulation", "expected_docs": ["bench://plant/coolant-system"]}
+{"id": "d3", "type": "direct", "query": "gearbox lubrication schedule torque", "expected_docs": ["bench://plant/drive-assembly"]}
+{"id": "d4", "type": "direct", "query": "film tension delta robots case loading", "expected_docs": ["bench://plant/packaging-cell"]}
+{"id": "r1", "type": "relational", "query": "what breaks down on the line-3 conveyor", "expected_docs": ["bench://plant/bearing-fatigue"]}
+{"id": "r2", "type": "relational", "query": "how do we detect trouble on the conveyor drive", "expected_docs": ["bench://plant/vibration-monitoring"]}
+{"id": "r3", "type": "relational", "query": "what has gone wrong with the coolant system", "expected_docs": ["bench://plant/pump-p7-report"]}
+{"id": "r4", "type": "relational", "query": "which storage rules apply to packaging cell labelling", "expected_docs": ["bench://plant/label-adhesive"]}
