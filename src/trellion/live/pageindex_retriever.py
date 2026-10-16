@@ -34,6 +34,7 @@ except ImportError:
     GRAPH_RANKER_AVAILABLE = False
 from trellion.live.pageindex_embedder import PageIndexEmbedder
 from trellion.live.pageindex_store import PageIndexStore
+from trellion.live.topic_diversity import diversify, topic_family
 
 log = structlog.get_logger(__name__)
 
@@ -41,6 +42,10 @@ log = structlog.get_logger(__name__)
 # Each embedding is ~3KB (768 floats × 4 bytes), so 1000 entries ≈ 3MB.
 _QUERY_EMBED_CACHE: OrderedDict[str, list[float]] = OrderedDict()
 _QUERY_EMBED_CACHE_MAX = 1000
+
+# Candidate pages fetched per answer slot. Was 2: with one topic filling
+# the first ten, no other topic was there for the diversity cap to pick.
+_POOL_FACTOR = 4
 
 
 @dataclass
@@ -158,7 +163,7 @@ class PageIndexRetriever:
             pages = await self._retrieve_pages_by_ids(
                 query_embedding,
                 candidate_page_ids,
-                top_k=top_k * 2,
+                top_k=top_k * _POOL_FACTOR,
                 doc_id_filter=list(candidate_doc_ids) if candidate_doc_ids else None,
                 roles=roles,
             )
@@ -167,12 +172,12 @@ class PageIndexRetriever:
             # No need to convert page_ids → doc_ids first.
             pages = await self.store.search_pages(
                 embedding=query_embedding,
-                top_k=top_k * 2,
+                top_k=top_k * _POOL_FACTOR,
                 doc_ids=list(candidate_doc_ids),
                 roles=roles,
             )
         else:
-            pages = await self.retrieve_pages(query_embedding, top_k=top_k * 2, roles=roles)
+            pages = await self.retrieve_pages(query_embedding, top_k=top_k * _POOL_FACTOR, roles=roles)
 
         # Step 2a: chunk-first recall — let chunks compete directly.
         #
@@ -246,8 +251,10 @@ class PageIndexRetriever:
             # No exc_info: a rich traceback carries locals (query text) to logs.
             log.warning("retriever.source_prior_adjustment_failed", error=type(exc).__name__)
 
-        # Take top pages
-        pages = pages[:top_k]
+        # Take top pages, at most a fair share per topic family
+        # (live/topic_diversity.py): one prolific source must not hide
+        # every other topic from a general question.
+        pages = await self._diverse_top(pages, top_k)
         log.info("retriever.pages_found", count=len(pages))
 
         # Step 3: Retrieve chunks within selected pages
@@ -506,6 +513,27 @@ class PageIndexRetriever:
                     break
 
         return filtered[:top_k]
+
+    async def _diverse_top(self, pages: list[dict], top_k: int) -> list[dict]:
+        """``pages[:top_k]`` with a per-family cap; plain truncation if the
+        titles cannot be read."""
+        if len(pages) <= top_k:
+            return pages
+        try:
+            titles = await self._get_doc_titles_batch(
+                list({str(p.get("doc_id", "")) for p in pages if p.get("doc_id")})
+            )
+        except Exception as exc:
+            log.warning("retriever.topic_diversity_skipped", error=type(exc).__name__)
+            return pages[:top_k]
+        picked = diversify(
+            pages,
+            lambda p: topic_family(titles.get(str(p.get("doc_id", "")), ""), str(p.get("doc_id", ""))),
+            top_k,
+        )
+        if [p.get("page_id") for p in picked] != [p.get("page_id") for p in pages[:top_k]]:
+            log.info("retriever.topic_diversity_applied", top_k=top_k, pool=len(pages))
+        return picked
 
     async def _get_doc_title(self, doc_id: str) -> str:
         """Look up a document title by doc_id."""
