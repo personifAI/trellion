@@ -25,6 +25,8 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from trellion import embedding_space
+
 
 logger = structlog.get_logger(__name__)
 
@@ -95,7 +97,11 @@ class TraversalArchiver:
         - ``evidence``: the save-time snapshot the recall hard gates re-check,
           ``{"triples": [[src, rel, dst], ...], "doc_ids": [...],
           "newest_evidence_at": iso8601}``. Stored verbatim.
-        - ``usefulness`` / ``expires_at`` / ``embedding_model``: stored as given.
+        - ``usefulness`` / ``expires_at``: stored as given.
+        - ``embedding_model``: the model that made ``query_embedding``. When
+          omitted it is the model the embed response named (carried on the
+          vector), else the space's current model. Recorded on BOTH the
+          traversal row and its episode row.
 
         ``user_id`` is also written onto the ``trellion_episodes`` row so
         erasure reaches the question text and embedding held there.
@@ -125,6 +131,9 @@ class TraversalArchiver:
 
         traversal_id = str(uuid.uuid4())
         frame_id = str(uuid.uuid4())
+        if query_embedding and not embedding_model:
+            embedding_model = await embedding_space.write_model(query_embedding)
+        emb_dim = len(query_embedding) if query_embedding else None
 
         try:
             # Postgres writes — single transaction so frame + traversal stay
@@ -152,6 +161,8 @@ class TraversalArchiver:
                         "kind": kind,
                     }),
                     "user_id": user_id or None,
+                    "emb_model": embedding_model if query_embedding else None,
+                    "emb_dim": emb_dim,
                 }
                 if query_embedding:
                     frame_params["femb"] = _vec_literal(query_embedding)
@@ -159,10 +170,11 @@ class TraversalArchiver:
                     text(
                         "INSERT INTO trellion_episodes "
                         "(id, persona_id, record_type, index_name, content_summary, "
-                        " prominence_score, metadata, embedding, user_id) "
+                        " prominence_score, metadata, embedding, user_id, "
+                        " embedding_model, embedding_dim) "
                         "VALUES (CAST(:id AS uuid), :persona, 'traversal', 'traversals', "
                         f"        :summary, :prominence, CAST(:meta AS jsonb), {frame_emb_sql}, "
-                        "        :user_id)"
+                        "        :user_id, :emb_model, :emb_dim)"
                     ),
                     frame_params,
                 )
@@ -191,7 +203,7 @@ class TraversalArchiver:
                     "usefulness": usefulness,
                     "expires_at": expires_at,
                     "emb_model": embedding_model,
-                    "emb_dim": len(query_embedding) if query_embedding else None,
+                    "emb_dim": emb_dim,
                 }
                 if query_embedding:
                     params["emb"] = _vec_literal(query_embedding)

@@ -115,6 +115,14 @@ class PaiEntry(Base):
     metadata_ = Column("metadata", JSONB, server_default=text("'{}'::jsonb"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
     embedding = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    # Provenance (migration 100; trellion_episodes 106): the model that made
+    # ``embedding`` and its width. Readers filter on the space's current model.
+    embedding_model = Column(Text, nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    # Re-embed staging (migration 106): filled while the space migrates to a
+    # new model, swapped into ``embedding`` at cutover, NULL otherwise.
+    embedding_next = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    embedding_next_model = Column(Text, nullable=True)
     indexed_at = Column(DateTime(timezone=True))
 
     conversation = relationship("PaiConversation", back_populates="entries")
@@ -269,6 +277,14 @@ class PageEmbedding(Base):
         primary_key=True,
     )
     embedding = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    # Provenance (migration 100; trellion_episodes 106): the model that made
+    # ``embedding`` and its width. Readers filter on the space's current model.
+    embedding_model = Column(Text, nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    # Re-embed staging (migration 106): filled while the space migrates to a
+    # new model, swapped into ``embedding`` at cutover, NULL otherwise.
+    embedding_next = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    embedding_next_model = Column(Text, nullable=True)
 
     page = relationship("Page", back_populates="embedding_rel")
 
@@ -290,6 +306,14 @@ class ChunkEmbedding(Base):
         primary_key=True,
     )
     embedding = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    # Provenance (migration 100; trellion_episodes 106): the model that made
+    # ``embedding`` and its width. Readers filter on the space's current model.
+    embedding_model = Column(Text, nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    # Re-embed staging (migration 106): filled while the space migrates to a
+    # new model, swapped into ``embedding`` at cutover, NULL otherwise.
+    embedding_next = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    embedding_next_model = Column(Text, nullable=True)
 
     chunk = relationship("PageChunk", back_populates="embedding_rel")
 
@@ -495,6 +519,14 @@ class EntityEmbedding(Base):
         primary_key=True,
     )
     embedding = Column(Vector(_EMBEDDING_DIM), nullable=False) if Vector else Column(Text, nullable=False)
+    # Provenance (migration 100; trellion_episodes 106): the model that made
+    # ``embedding`` and its width. Readers filter on the space's current model.
+    embedding_model = Column(Text, nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    # Re-embed staging (migration 106): filled while the space migrates to a
+    # new model, swapped into ``embedding`` at cutover, NULL otherwise.
+    embedding_next = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    embedding_next_model = Column(Text, nullable=True)
     computed_at = Column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
     generation = Column(Integer, nullable=False, server_default=text("0"))
 
@@ -520,6 +552,14 @@ class EntityCluster(Base):
     )
     summary = Column(Text, nullable=True)
     centroid = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    # Provenance (migration 100; trellion_episodes 106): the model that made
+    # ``centroid`` and its width. Readers filter on the space's current model.
+    embedding_model = Column(Text, nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    # Re-embed staging (migration 106): filled while the space migrates to a
+    # new model, swapped into ``centroid`` at cutover, NULL otherwise.
+    embedding_next = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    embedding_next_model = Column(Text, nullable=True)
     member_count = Column(Integer, nullable=False, server_default=text("0"))
     computed_at = Column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
     generation = Column(Integer, nullable=False, server_default=text("0"))
@@ -630,6 +670,14 @@ class TrellionConcept(Base):
     aliases = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     # Optional centroid embedding for hybrid concept matching at query time
     centroid = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    # Provenance (migration 100; trellion_episodes 106): the model that made
+    # ``centroid`` and its width. Readers filter on the space's current model.
+    embedding_model = Column(Text, nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    # Re-embed staging (migration 106): filled while the space migrates to a
+    # new model, swapped into ``centroid`` at cutover, NULL otherwise.
+    embedding_next = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    embedding_next_model = Column(Text, nullable=True)
     extra = Column("metadata", JSONB, server_default=text("'{}'::jsonb"))
 
 
@@ -733,6 +781,14 @@ class TrellionEpisode(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
     # pgvector search column (migration 101); dim matches EMBEDDING_DIM.
     embedding = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    # Provenance (migration 100; trellion_episodes 106): the model that made
+    # ``embedding`` and its width. Readers filter on the space's current model.
+    embedding_model = Column(Text, nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    # Re-embed staging (migration 106): filled while the space migrates to a
+    # new model, swapped into ``embedding`` at cutover, NULL otherwise.
+    embedding_next = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    embedding_next_model = Column(Text, nullable=True)
     # Owner of the episode (migration 104): the asker whose question text and
     # embedding this row carries. NULL = unattributed. Erasure keys on it.
     user_id = Column(Text, nullable=True)
@@ -757,6 +813,14 @@ class TrellionTraversalRecord(Base):
     persona_id = Column(Text, nullable=False)
     query_text = Column(Text, nullable=False)
     query_embedding = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    # Provenance (migration 100; trellion_episodes 106): the model that made
+    # ``query_embedding`` and its width. Readers filter on the space's current model.
+    embedding_model = Column(Text, nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
+    # Re-embed staging (migration 106): filled while the space migrates to a
+    # new model, swapped into ``query_embedding`` at cutover, NULL otherwise.
+    embedding_next = Column(Vector(_EMBEDDING_DIM)) if Vector else Column(Text)
+    embedding_next_model = Column(Text, nullable=True)
     intent = Column(Text, nullable=True)
     traversal_path = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     outcome_score = Column(Float, nullable=False)

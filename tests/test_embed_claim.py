@@ -37,7 +37,12 @@ def test_claiming_adds_no_migration():
     """The fix is query-only. A migration would force a lockstep release
     (trellion-protocols, both pins, intel's expected schema revision)."""
     names = sorted(p.name for p in VERSIONS.glob("*.py") if p.name != "__init__.py")
-    assert names[-1] == "105_doc_hold.py" and len(names) == 6, names
+    # The claim fix landed on top of 105; later migrations (106 is the
+    # embedding provenance work) are other changes and are tested on their own.
+    assert names[:6] == [
+        "100_trellion_squash.py", "101_frame_embeddings.py", "102_episodes_rename.py",
+        "103_extraction_converges.py", "104_recallable_walks.py", "105_doc_hold.py",
+    ], names
 
 
 @pytest.fixture

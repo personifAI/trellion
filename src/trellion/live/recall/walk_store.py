@@ -22,6 +22,8 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from trellion import embedding_space
+
 from .archiver import WALK_KINDS, _vec_literal
 
 logger = structlog.get_logger(__name__)
@@ -91,6 +93,11 @@ class WalkStore:
             params["uid"] = str(user_id)
         if persona_id:
             params["persona"] = persona_id
+        model_sql, model_params = await embedding_space.model_clause(
+            "embedding_model", query_vector=query_embedding
+        )
+        model_where = f"  AND {model_sql} " if model_sql else ""
+        params.update(model_params)
         async with self._engine.connect() as conn:
             rows = (
                 await conn.execute(
@@ -101,6 +108,7 @@ class WalkStore:
                         f"WHERE {owner} AND kind = :kind AND status = 'active' "
                         f"  {persona}"
                         "  AND query_embedding IS NOT NULL "
+                        f"{model_where}"
                         "  AND (expires_at IS NULL OR expires_at > NOW()) "
                         "ORDER BY query_embedding <=> CAST(:vec AS vector) "
                         "LIMIT :k"

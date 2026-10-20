@@ -37,6 +37,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert as pg_insert, JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from .. import embedding_space
 from ..db.models import (
     PaiConversation,
     PaiEntry,
@@ -996,6 +997,15 @@ class ConversationStore:
                 where_parts.append("(c.persona_id = :persona_id OR c.persona_id IS NULL)")
                 params["persona_id"] = persona_id
 
+            # Compare only vectors from the space's current model (dropped,
+            # never emptied, when the model cannot be determined).
+            model_sql, model_params = await embedding_space.model_clause(
+                "e.embedding_model", query_vector=embedding
+            )
+            if model_sql:
+                where_parts.append(model_sql)
+                params.update(model_params)
+
             where_sql = " AND ".join(where_parts)
 
             rows = (await conn.execute(text(f"""
@@ -1118,9 +1128,15 @@ class ConversationStore:
         async with self._engine.connect() as conn:
             result = await conn.execute(text(f"""
                 UPDATE {_entry.name}
-                SET embedding = CAST(:vec AS vector), indexed_at = NOW()
+                SET embedding = CAST(:vec AS vector), indexed_at = NOW(),
+                    embedding_model = :model, embedding_dim = :dim,
+                    embedding_next = NULL, embedding_next_model = NULL
                 WHERE id = :id
-            """), {"vec": vector, "id": entry_id})
+            """), {
+                "vec": vector, "id": entry_id,
+                "model": embedding_space.model_of(embedding),
+                "dim": len(embedding),
+            })
             await conn.commit()
             return result.rowcount > 0
 
@@ -1134,11 +1150,19 @@ class ConversationStore:
         if not updates:
             return 0
 
-        rows = [{"id": eid, "vec": self._format_vector(emb)} for eid, emb in updates]
+        rows = [
+            {
+                "id": eid, "vec": self._format_vector(emb),
+                "model": embedding_space.model_of(emb), "dim": len(emb),
+            }
+            for eid, emb in updates
+        ]
         async with self._engine.connect() as conn:
             await conn.execute(text(f"""
                 UPDATE {_entry.name}
-                SET embedding = CAST(:vec AS vector), indexed_at = NOW()
+                SET embedding = CAST(:vec AS vector), indexed_at = NOW(),
+                    embedding_model = :model, embedding_dim = :dim,
+                    embedding_next = NULL, embedding_next_model = NULL
                 WHERE id = :id
             """), rows)
             await conn.commit()

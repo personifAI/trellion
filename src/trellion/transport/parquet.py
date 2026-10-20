@@ -411,7 +411,8 @@ class ParquetShardPackager:
             rows = (await conn.execute(
                 text(
                     "SELECT id::text AS id, persona_id, query_text, "
-                    "       query_embedding::text AS query_embedding_text, intent, "
+                    "       query_embedding::text AS query_embedding_text, "
+                    "       embedding_model, intent, "
                     "       traversal_path::text AS traversal_path_json, outcome_score, "
                     "       exploration_rate, "
                     "       uncertainty_fingerprint::text AS uncertainty_fingerprint_json, "
@@ -499,12 +500,19 @@ class ParquetShardPackager:
                 await conn.execute(
                     text(
                         "INSERT INTO trellion_traversal_records "
-                        "(id, persona_id, query_text, query_embedding, intent, "
+                        "(id, persona_id, query_text, query_embedding, "
+                        " embedding_model, embedding_dim, intent, "
                         " traversal_path, outcome_score, exploration_rate, "
                         " uncertainty_fingerprint, archived_to_video, video_frame_id, "
                         " created_at, updated_at) "
                         "VALUES (CAST(:id AS uuid), :p, :q, "
                         "        CASE WHEN :emb IS NULL THEN NULL::vector ELSE CAST(:emb AS vector) END, "
+                        # The model travels with the shard (a shard from an older
+                        # build carries none: NULL, labelled by the worker's legacy
+                        # claim). The width is the vector's own.
+                        "        CASE WHEN :emb IS NULL THEN NULL ELSE CAST(:emb_model AS text) END, "
+                        "        CASE WHEN :emb IS NULL THEN NULL "
+                        "             ELSE vector_dims(CAST(:emb AS vector)) END, "
                         "        :intent, "
                         "        CAST(:path AS jsonb), :outcome, :rate, "
                         "        CAST(:uf AS jsonb), :archived, "
@@ -515,6 +523,7 @@ class ParquetShardPackager:
                     {
                         "id": r["id"], "p": r["persona_id"], "q": r["query_text"],
                         "emb": r.get("query_embedding_text"),
+                        "emb_model": r.get("embedding_model"),
                         "intent": r.get("intent"),
                         "path": r.get("traversal_path_json") or "[]",
                         "outcome": r["outcome_score"], "rate": r.get("exploration_rate"),

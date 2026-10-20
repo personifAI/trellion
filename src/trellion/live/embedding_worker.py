@@ -33,6 +33,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 
+from trellion import embedding_space
+
 logger = structlog.get_logger()
 
 
@@ -409,6 +411,7 @@ class EmbeddingWorker:
                 used="gateway",
             )
         base_url = base_url or "https://localhost:8080"
+        embedding_space.configure_url(base_url)
 
         def embed_gateway(text: str) -> List[float]:
             # The one door: gateway_auth. A second signer beside
@@ -422,13 +425,15 @@ class EmbeddingWorker:
             ) as client:
                 response = client.post(
                     f"{base_url}/api/external/embeddings",
-                    json={"input": [text]},
+                    json={"input": [text], "model": embedding_space.space_name()},
                 )
                 response.raise_for_status()
-                data = response.json().get("data") or []
-                if not data:
+                # A Vector: the list plus the model the response named, so the
+                # store records embedding_model for the row it writes.
+                out = embedding_space.from_response(response.json())
+                if not out:
                     raise RuntimeError("gateway returned no embedding")
-                return data[0]["embedding"]
+                return out[0]
 
         logger.info("embedder_created", backend="gateway", url=base_url)
         return embed_gateway

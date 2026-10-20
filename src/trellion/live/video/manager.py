@@ -28,6 +28,8 @@ from typing import Any, Optional
 import httpx
 import structlog
 
+from trellion import embedding_space
+
 from .config import VideoMemoryConfig
 from .traversal_archiver import TraversalArchiver, TraversalSnapshot
 
@@ -93,6 +95,7 @@ class VideoMemoryManager:
     ) -> None:
         self.config = config
         self.embedding_url = embedding_url.rstrip("/")
+        embedding_space.configure_url(self.embedding_url)
         self.gateway_url = gateway_url.rstrip("/")
         self._conversation_store = conversation_store
 
@@ -427,11 +430,13 @@ class VideoMemoryManager:
             ) as client:
                 resp = await client.post(
                     f"{self.embedding_url}/api/external/embeddings",
-                    json={"input": [text]},
+                    json={"input": [text], "model": embedding_space.space_name()},
                 )
                 resp.raise_for_status()
-                rows = resp.json().get("data") or []
-                return rows[0].get("embedding") if rows else None
+                # A Vector: the list plus the model the response named, so a
+                # similarity search over episodes compares like with like.
+                out = embedding_space.from_response(resp.json())
+                return out[0] if out else None
         except Exception:
             logger.warning("video_memory.embed_failed", exc_info=True)
             return None
