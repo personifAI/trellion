@@ -64,6 +64,7 @@ class Gateway:
         self.puts: list[dict] = []
         self.embeds: list[dict] = []
         self.caps_calls = 0
+        self.poison: set[str] = set()  # inputs the gateway rejects with a 400
         self.embed_model = None  # what the response names; defaults to the alias's model
 
     def space_entry(self):
@@ -84,6 +85,8 @@ class Gateway:
         if request.method == "POST" and path == "/api/external/embeddings":
             body = json.loads(request.content)
             self.embeds.append(body)
+            if self.poison & set(body["input"]):
+                return httpx.Response(400, json={"error": "rejected"})
             if body.get("model") == "knowledge@next":
                 served = (self.migration or {}).get("next_model")
             else:
@@ -215,6 +218,14 @@ def test_progress_payload_matches_the_contract_exactly():
             "trellion_concepts": {"done": 0, "total": 4},
         },
         "cutover_done": False,
+    }
+
+
+def test_progress_body_adds_unsourced_when_given():
+    body = es.build_progress("m2", {"trellion_concepts": (0, 0, 7), "page_embeddings": (1, 2)}, False)
+    assert body["tables"] == {
+        "trellion_concepts": {"done": 0, "total": 0, "unsourced": 7},
+        "page_embeddings": {"done": 1, "total": 2},
     }
 
 
@@ -683,9 +694,9 @@ async def test_reembed_fills_the_staging_column_and_reports_progress(world, gw):
     assert last["next_model"] == f"n-{tag}" and last["cutover_done"] is False
     assert set(last["tables"]) == VECTOR_TABLES
     for t in last["tables"].values():
-        assert set(t) == {"done", "total"} and t["done"] <= t["total"]
+        assert set(t) == {"done", "total", "unsourced"} and t["done"] <= t["total"]
     assert last["tables"]["page_embeddings"]["done"] >= 3
-    # the underivable table is counted, never invented
+    # the underivable table is never invented: not in done/total
     assert last["tables"]["trellion_concepts"]["done"] == 0
 
 
@@ -813,3 +824,119 @@ async def test_derived_tables_episodes_and_clusters(world, gw):
                          ids=ents)
         await store_exec(store, "DELETE FROM trellion_traversal_records WHERE id = CAST(:t AS uuid)", t=trav)
         await store_exec(store, "DELETE FROM trellion_episodes WHERE id = CAST(:f AS uuid)", f=frame)
+
+
+async def _fill_all(w, n=6):
+    for _ in range(n):
+        await w.run_pass()
+        w._idle_until.clear()
+
+
+@needs_db
+async def test_unsourced_rows_are_reported_and_dropped_at_cutover(world, gw):
+    store, tag, make = world
+    gw.model = f"m-{tag}"
+    nxt = f"n-{tag}"
+    lit = "[" + ",".join(["1"] + ["0"] * (DIM - 1)) + "]"
+    concept_snap, concept, orphan = (str(uuid.uuid4()) for _ in range(3))
+    try:
+        await store_exec(store, "INSERT INTO trellion_snapshots (id, generation, slice_kind) "
+                         "VALUES (CAST(:s AS uuid), 1, 'topic')", s=concept_snap)
+        await store_exec(store, "INSERT INTO trellion_concepts (id, snapshot_id, canonical_name, "
+                         "type, centroid, embedding_model) VALUES (CAST(:c AS uuid), "
+                         "CAST(:s AS uuid), :n, 't', CAST(:v AS vector), 'old')",
+                         c=concept, s=concept_snap, n=tag, v=lit)
+        await store_exec(store, "INSERT INTO trellion_episodes (id, persona_id, record_type, "
+                         "index_name, content_summary, embedding, embedding_model) VALUES "
+                         "(CAST(:f AS uuid), 'p', 'conversation', 'c', 's', CAST(:v AS vector), 'old')",
+                         f=orphan, v=lit)
+        gw.migration = filling(tag)
+        fresh_space()
+        w = ReembedWorker(store.engine, make_embedder(store, gw)._embed_next, batch_size=64)
+        await _fill_all(w, 2)
+        await w.report(nxt, cutover_done=False)
+        tables = gw.puts[-1]["tables"]
+        assert tables["trellion_concepts"]["unsourced"] >= 1
+        assert tables["trellion_episodes"]["unsourced"] >= 1
+        assert tables["trellion_concepts"]["done"] == 0
+
+        gw.migration = {**filling(tag), "state": "cutover"}
+        fresh_space()
+        await w.run_pass()
+        got = await _fetch(store, "SELECT centroid IS NULL, embedding_model IS NULL "
+                           "FROM trellion_concepts WHERE id = CAST(:c AS uuid)", c=concept)
+        assert tuple(got[0]) == (True, True)  # no old-model vector under the new model
+        got = await _fetch(store, "SELECT embedding IS NULL, embedding_model IS NULL "
+                           "FROM trellion_episodes WHERE id = CAST(:f AS uuid)", f=orphan)
+        assert tuple(got[0]) == (True, True)
+    finally:
+        await store_exec(store, "DELETE FROM trellion_snapshots WHERE id = CAST(:s AS uuid)", s=concept_snap)
+        await store_exec(store, "DELETE FROM trellion_episodes WHERE id = CAST(:f AS uuid)", f=orphan)
+
+
+@needs_db
+async def test_a_poison_row_is_retried_alone_then_skipped_and_the_migration_completes(world, gw):
+    store, tag, make = world
+    gw.model = f"m-{tag}"
+    nxt = f"n-{tag}"
+    rows, e = await _embed_world(store, gw, make, 3)
+    pids = [r["page_id"] for r in rows]
+    gw.poison = {f"{tag} page 1"}
+    gw.migration = filling(tag)
+    fresh_space()
+    w = ReembedWorker(store.engine, e._embed_next, batch_size=64)
+    with structlog.testing.capture_logs() as logs:
+        await _fill_all(w, 4)
+    assert [x["pk"] for x in logs if x["event"] == "reembed.row_skipped"] == [pids[1]]
+    got = {r[0]: r[1] for r in await _fetch(
+        store, "SELECT page_id::text, embedding_next_model FROM page_embeddings "
+        "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)}
+    assert got == {pids[0]: nxt, pids[1]: None, pids[2]: nxt}
+    await w.report(nxt, cutover_done=False)
+    # the skipped row counts as unsourced, so done can still reach total
+    assert gw.puts[-1]["tables"]["page_embeddings"]["unsourced"] >= 1
+    # cutover drops the skipped row's old-model vector instead of leaving it
+    gw.migration = {**filling(tag), "state": "cutover"}
+    fresh_space()
+    await w.run_pass()
+    got = {r[0]: r[1] for r in await _fetch(
+        store, "SELECT page_id::text, embedding_model FROM page_embeddings "
+        "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)}
+    assert got == {pids[0]: nxt, pids[1]: None, pids[2]: nxt}
+
+
+@needs_db
+async def test_stale_sweep_heals_rows_written_under_an_old_model(world, gw):
+    store, tag, make = world
+    gw.model = f"m-{tag}"
+    rows, e = await _embed_world(store, gw, make, 2)
+    pids = [r["page_id"] for r in rows]
+    await store_exec(store, "UPDATE page_embeddings SET embedding_model = 'm-stale' "
+                     "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)
+    gw.migration = None
+    fresh_space()
+    w = ReembedWorker(store.engine, e._embed_next, embed_live=e.embed_batch, batch_size=64)
+    before = len(gw.embeds)
+    await w.run_pass()
+    got = await _fetch(store, "SELECT embedding_model FROM page_embeddings "
+                       "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)
+    assert {r[0] for r in got} == {f"m-{tag}"}
+    assert all(b["model"] == "knowledge" for b in gw.embeds[before:])  # the plain space model
+
+
+@needs_db
+async def test_stale_sweep_skips_a_poison_row(world, gw):
+    store, tag, make = world
+    gw.model = f"m-{tag}"
+    rows, e = await _embed_world(store, gw, make, 2)
+    pids = [r["page_id"] for r in rows]
+    await store_exec(store, "UPDATE page_embeddings SET embedding_model = 'm-stale' "
+                     "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)
+    gw.poison = {f"{tag} page 0"}
+    fresh_space()
+    w = ReembedWorker(store.engine, e._embed_next, embed_live=e.embed_batch, batch_size=64)
+    await w.run_pass()
+    got = {r[0]: r[1] for r in await _fetch(
+        store, "SELECT page_id::text, embedding_model FROM page_embeddings "
+        "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)}
+    assert got == {pids[0]: "m-stale", pids[1]: f"m-{tag}"}

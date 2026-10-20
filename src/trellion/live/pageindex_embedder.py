@@ -385,7 +385,10 @@ class PageIndexEmbedder:
 
         engine = getattr(self.store, "_engine", None)
         self._reembed = (
-            ReembedWorker(engine, self._embed_next, batch_size=self.batch_size)
+            ReembedWorker(
+                engine, self._embed_next, embed_live=self.embed_batch,
+                batch_size=self.batch_size,
+            )
             if engine is not None
             else None
         )
