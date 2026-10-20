@@ -100,10 +100,25 @@ embeds, rebuilt from `entities` and `edges`). Derived, not embedded:
 `entity_clusters` (a leaf centroid is the mean of its members' staged vectors, a
 parent's the member-weighted mean of its children's) and `trellion_episodes`
 (copied from the traversal record it was archived with; an episode with no such
-record cannot be re-embedded). `trellion_concepts.centroid` has neither stored
-text nor a derivation in trellion: it is counted in the progress report
-(`done` stays 0) and never invented, so the gateway will not accept completion
-while such rows exist.
+record cannot be re-embedded). **Unsourced rows.** `trellion_concepts.centroid` (nothing in trellion,
+trellion-intel or trellion-evolve writes it) and episodes with no traversal
+record have neither stored text nor a derivation, and a row the embedder rejects
+even when sent alone (retried one at a time, then logged `reembed.row_skipped`
+and skipped for this migration) cannot be re-embedded. None is invented. They
+are left out of `done`/`total` and reported per table as
+`"unsourced": N` (`{done, total, unsourced}`). At cutover their vector and
+`embedding_model` are set to NULL in the same transaction (a skipped
+`entity_embeddings` row is deleted, its column being NOT NULL), so they drop out
+of search instead of keeping an old-model vector under the new model. Whatever
+owns them regenerates them on its next run.
+
+**Stale sweep.** With no migration running, rows whose `embedding_model` is set
+but is not the space's current model, and that have a source, are re-embedded
+into the live column with the plain space model (episodes copy from their
+traversal record). Same cadence as the legacy claim: at start, on a state
+change, then every five minutes. This heals the brief cutover race and anything
+else written under an old model. Cluster centroids follow their members on the
+next clustering run.
 
 Any ordinary write of a vector clears that row's staged `embedding_next` (it
 was computed from content that has just changed). The staging columns are

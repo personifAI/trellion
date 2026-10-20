@@ -304,20 +304,25 @@ async def write_model(vector: Any = None) -> Optional[str]:
 # ----------------------------------------------------------------------
 
 
-def build_progress(next_model: str, tables: dict[str, tuple[int, int]], cutover_done: bool) -> dict:
+def build_progress(next_model: str, tables: dict[str, tuple], cutover_done: bool) -> dict:
     """The exact body of the progress PUT.
 
-    ``tables`` maps table -> ``(done, total)``.
+    ``tables`` maps table -> ``(done, total)`` or ``(done, total, unsourced)``.
+    ``unsourced`` counts rows that have an embedding but no stored source or
+    derivation to re-embed from (or that were skipped); they are left out of
+    ``done``/``total``. The gateway ignores keys it does not know.
     """
-    return {
-        "next_model": next_model,
-        "tables": {t: {"done": int(d), "total": int(n)} for t, (d, n) in tables.items()},
-        "cutover_done": bool(cutover_done),
-    }
+    out: dict[str, dict] = {}
+    for t, counts in tables.items():
+        entry = {"done": int(counts[0]), "total": int(counts[1])}
+        if len(counts) > 2:
+            entry["unsourced"] = int(counts[2])
+        out[t] = entry
+    return {"next_model": next_model, "tables": out, "cutover_done": bool(cutover_done)}
 
 
 def put_progress(
-    next_model: str, tables: dict[str, tuple[int, int]], cutover_done: bool = False
+    next_model: str, tables: dict[str, tuple], cutover_done: bool = False
 ) -> Optional[dict]:
     """``PUT /api/external/embedding-spaces/{space}/migration``.
 
@@ -343,6 +348,6 @@ def put_progress(
 
 
 async def aput_progress(
-    next_model: str, tables: dict[str, tuple[int, int]], cutover_done: bool = False
+    next_model: str, tables: dict[str, tuple], cutover_done: bool = False
 ) -> Optional[dict]:
     return await asyncio.to_thread(put_progress, next_model, tables, cutover_done)
