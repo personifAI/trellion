@@ -14,7 +14,7 @@ dependencies = [
     # The interface trellion offers add-ons (Apache-2.0, its own repo). Pinned
     # by full commit SHA, never by tag alone: tags can be moved.
     # v0.1.0
-    "trellion-protocols @ git+https://github.com/personifAI/trellion-protocols.git@2854dad7874696720c10e711288011d478de2280",
+    "trellion-protocols @ git+https://github.com/personifAI/trellion-protocols.git@2da35d20bbe693b38616da626fd75b2d05d58e91",
     # I/O + orchestration
     "typer>=0.12",
     "pydantic>=2.7",
