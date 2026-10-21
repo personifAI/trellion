@@ -530,7 +530,11 @@ def test_cutover_sql_swaps_one_table_and_only_staged_rows():
         assert sql.rstrip().endswith("WHERE embedding_next_model = :next")
 
 
-def test_entity_description_is_the_intel_format():
+def test_entity_description_is_the_shared_protocols_recipe():
+    from trellion_protocols import embedding_text
+
+    # one function, not a copy: the entity-vector writer calls the same one
+    assert reembed.entity_description is embedding_text.entity_description
     assert reembed.entity_description("python", "language", []) == "python (language)"
     nb = [
         {"name": "memory leaks", "type": "concept", "rel_type": "CAUSES", "direction": "outgoing"},
@@ -907,6 +911,38 @@ async def test_a_poison_row_is_retried_alone_then_skipped_and_the_migration_comp
         store, "SELECT page_id::text, embedding_model FROM page_embeddings "
         "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)}
     assert got == {pids[0]: nxt, pids[1]: None, pids[2]: nxt}
+
+
+@needs_db
+async def test_tied_neighbours_are_described_in_one_fixed_order(world, gw):
+    """Edges with equal (or NULL) confidence used to come back in any order.
+
+    Six neighbours tie (NULL confidence, one relation) and are inserted in
+    reverse name order, which is the order Postgres handed them back in before
+    the tie-break; one stronger edge, whose relation sorts last, still leads.
+    """
+    store, tag, make = world
+    ent, strong = str(uuid.uuid4()), str(uuid.uuid4())
+    tied = [str(uuid.uuid4()) for _ in range(6)]
+    names = {ent: f"{tag}-x", strong: f"{tag}-s"}
+    names.update({t: f"{tag}-n{5 - i}" for i, t in enumerate(tied)})
+    try:
+        for eid, name in names.items():
+            await store_exec(store, "INSERT INTO entities (entity_id, canonical_name, type) "
+                             "VALUES (CAST(:e AS uuid), :n, 't')", e=eid, n=name)
+        for dst, rel, conf in [(t, "R1", None) for t in tied] + [(strong, "R9", 2.0)]:
+            await store_exec(store, "INSERT INTO edges (edge_id, src_entity_id, dst_entity_id, "
+                             "rel_type, confidence) VALUES (gen_random_uuid(), CAST(:s AS uuid), "
+                             "CAST(:d AS uuid), :r, :c)", s=ent, d=dst, r=rel, c=conf)
+        w = ReembedWorker(store.engine, lambda t: None)
+        async with store.engine.connect() as conn:
+            got = await w._describe(conn, [ent])
+        want = ", ".join([f"R9 -> {tag}-s (t)"] + [f"R1 -> {tag}-n{i} (t)" for i in range(6)])
+        assert got[ent] == f"{tag}-x (t): {want}"
+    finally:
+        await store_exec(store, "DELETE FROM edges WHERE src_entity_id = CAST(:e AS uuid)", e=ent)
+        await store_exec(store, "DELETE FROM entities WHERE entity_id = ANY(CAST(:ids AS uuid[]))",
+                         ids=list(names))
 
 
 @needs_db
