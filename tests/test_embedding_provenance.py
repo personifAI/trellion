@@ -77,7 +77,7 @@ class Gateway:
             raise httpx.ConnectError("gateway down", request=request)
         if request.method == "GET" and path == "/api/external/capabilities":
             self.caps_calls += 1
-            return httpx.Response(200, json={"embedding": {"spaces": [self.space_entry()]}})
+            return httpx.Response(200, json={"embeddings": {"spaces": [self.space_entry()]}})
         if request.method == "PUT" and path == "/api/external/embedding-spaces/knowledge/migration":
             body = json.loads(request.content)
             self.puts.append(body)
@@ -162,7 +162,7 @@ def test_response_model_rides_on_the_vectors():
 
 
 def test_parse_space_reads_the_migration_block():
-    payload = {"embedding": {"spaces": [
+    payload = {"embeddings": {"spaces": [
         {"space": "a", "model": "ma", "dims": 1024, "default": False, "migration": None},
         {"space": "knowledge", "model": "m1", "dims": 1024, "default": True, "migration": {
             "next_model": "m2", "next_dims": 1024, "state": "filling",
@@ -174,6 +174,10 @@ def test_parse_space_reads_the_migration_block():
     assert es.parse_space(payload, "a").migration is None
     assert es.parse_space(payload, "nope") is None
     assert es.parse_space({}, "knowledge") is None
+    # The gateway's block is `embeddings` (plural, beside `chat`, `rerank`);
+    # a singular key once made the worker find no space against a real gateway
+    # while every fixture written to match the reader passed.
+    assert es.parse_space({"embedding": payload["embeddings"]}, "knowledge") is None
 
 
 def test_space_record_is_cached_and_stale_beats_nothing(gw, monkeypatch):
