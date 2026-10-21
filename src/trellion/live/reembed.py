@@ -31,9 +31,10 @@ vector (it was computed from content that just changed).
 Re-embedding, table by table (``kind``):
 
 ``text``     source text is stored; re-embedded with ``<space>@next``.
-``entity``   the neighbourhood description trellion-intel embeds
-             (``name (type): REL -> neighbour (type), ...``), rebuilt from the
-             stored ``entities`` and ``edges``.
+``entity``   the neighbourhood description the entity-vector writer embeds
+             (``name (type): REL -> neighbour (type), ...``,
+             :func:`trellion_protocols.embedding_text.entity_description`),
+             rebuilt from the stored ``entities`` and ``edges``.
 ``cluster``  derived: leaf centroid = mean of its members' staged vectors;
              parent centroid = member-weighted mean of its children's.
 ``episode``  derived: copied from the traversal record it was archived with.
@@ -62,6 +63,14 @@ from typing import Any, Awaitable, Callable, Optional
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+# The entity text recipe lives in trellion-protocols: the entity-vector writer
+# and this re-embed call one function, so their text cannot drift.
+from trellion_protocols.embedding_text import (
+    ENTITY_DESCRIPTION_MAX_NEIGHBOURS,
+    ENTITY_NEIGHBOUR_ORDER_SQL,
+    entity_description,
+)
 
 from trellion import embedding_space
 from trellion.embedding_space import Embeddings, SpaceRecord
@@ -137,29 +146,6 @@ def _parse_vec(s: Optional[str]) -> list[float]:
     if not s:
         return []
     return [float(x) for x in s.strip("[]").split(",") if x != ""]
-
-
-def entity_description(name: str, etype: str, neighbours: list[dict]) -> str:
-    """The text trellion-intel embeds for an entity.
-
-    SOURCE OF TRUTH: ``GraphEntityEmbedder._build_entity_description`` in
-    trellion-intel (``graph_embedder.py``). This is a copy so a re-embed can
-    reproduce the recipe without importing the add-on; tests/test_embedding_
-    provenance.py pins the format. Change them together (follow-up: move the
-    builder here and have intel call it).
-
-    ``neighbours`` are ``{name, type, rel_type, direction}`` in descending
-    confidence order. Kept byte-identical to the intel builder so a re-embed
-    reproduces the original recipe.
-    """
-    header = f"{name} ({etype})"
-    if not neighbours:
-        return header
-    parts = []
-    for nb in neighbours:
-        arrow = "->" if nb["direction"] == "outgoing" else "<-"
-        parts.append(f"{nb['rel_type']} {arrow} {nb['name']} ({nb['type']})")
-    return f"{header}: {', '.join(parts)}"
 
 
 class ReembedWorker:
@@ -456,6 +442,8 @@ class ReembedWorker:
         "{after} ORDER BY t.entity_id LIMIT :limit FOR NO KEY UPDATE OF t SKIP LOCKED"
     )
 
+    #: Neighbour selection per trellion-protocols' contract: the same rows,
+    #: cap and order the entity-vector writer uses.
     _ENTITY_NEIGHBOURS = (
         "SELECT ent.entity_id, ent.canonical_name, ent.type, nb.name, nb.type, "
         "       nb.rel_type, nb.direction "
@@ -464,12 +452,12 @@ class ReembedWorker:
         "  SELECT n.canonical_name AS name, n.type AS type, e.rel_type AS rel_type, "
         "         CASE WHEN e.src_entity_id = ent.entity_id THEN 'outgoing' "
         "              ELSE 'incoming' END AS direction, "
-        "         ROW_NUMBER() OVER (ORDER BY COALESCE(e.confidence, 1.0) DESC) AS rn "
+        f"         ROW_NUMBER() OVER (ORDER BY {ENTITY_NEIGHBOUR_ORDER_SQL}) AS rn "
         "  FROM edges e "
         "  JOIN entities n ON n.entity_id = CASE WHEN e.src_entity_id = ent.entity_id "
         "                                        THEN e.dst_entity_id ELSE e.src_entity_id END "
         "  WHERE e.src_entity_id = ent.entity_id OR e.dst_entity_id = ent.entity_id "
-        "  ORDER BY COALESCE(e.confidence, 1.0) DESC LIMIT 20"
+        f"  ORDER BY {ENTITY_NEIGHBOUR_ORDER_SQL} LIMIT {ENTITY_DESCRIPTION_MAX_NEIGHBOURS}"
         ") nb ON TRUE "
         "WHERE ent.entity_id = ANY(CAST(:ids AS uuid[])) "
         "ORDER BY ent.entity_id, nb.rn"
