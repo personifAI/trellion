@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Dependency update PRs, all targeting `dev` (the integration branch; staging and main change by promotion only).
+# Minor and patch bumps are grouped per ecosystem so one PR carries them;
+# majors arrive one per PR. dependabot-auto-merge.yml puts minor/patch PRs in
+# the merge queue once CI is green; majors and github-actions bumps wait for
+# a person.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      pip-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      github-minor-patch:
+        update-types:
+          - minor
+          - patch
