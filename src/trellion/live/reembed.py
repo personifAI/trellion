@@ -48,6 +48,12 @@ not sit under the new model), so they drop out of search until whatever owns
 them regenerates them on its next run. Nothing in trellion, trellion-intel or
 trellion-evolve writes concept centroids.
 
+A skipped row also skips what is DERIVED from it, or the migration could never
+complete (the gateway refuses ``complete`` until every table's done==total):
+an episode whose every traversal record is skipped (or has no vector), and a
+cluster with no member and no child left to derive from. A cluster that keeps
+some inputs is derived from those alone. See :meth:`ReembedWorker.skip_dependents`.
+
 STALE sweep (no migration running): rows whose ``embedding_model`` is set but
 is not the space's current model, and that have a source, are re-embedded into
 the LIVE column with the plain space model. That heals a cutover race and
@@ -300,6 +306,7 @@ class ReembedWorker:
                     self._idle_until[spec.name] = self._clock() + TABLE_IDLE_S
                 self._cursor[spec.name] = None
         if self._clock() - self._last_report >= PROGRESS_EVERY_S:
+            await self.skip_dependents(nxt)
             await self.report(nxt, cutover_done=False)
         return worked
 
@@ -400,6 +407,84 @@ class ReembedWorker:
 
     def _is_skipped(self, spec: TableSpec, pk: str, key: str) -> bool:
         return (spec.name, pk, key) in self._skipped
+
+    def _skipped_pks(self, table: str, key: str) -> list[str]:
+        return [k[1] for k in self._skipped if k[0] == table and k[2] == key]
+
+    # -- rows whose source was skipped -------------------------------------
+
+    #: Episodes with a traversal record, none of which is staged or can still
+    #: be (a record is claimable only while it has a vector and is not skipped).
+    DEAD_EPISODES_SQL = (
+        "SELECT e.id FROM trellion_episodes e "
+        "WHERE e.embedding IS NOT NULL AND e.embedding_next_model IS DISTINCT FROM :next "
+        "AND EXISTS (SELECT 1 FROM trellion_traversal_records r WHERE r.video_frame_id = e.id) "
+        "AND NOT EXISTS (SELECT 1 FROM trellion_traversal_records r "
+        "  WHERE r.video_frame_id = e.id AND (r.embedding_next_model = :next "
+        "    OR (r.query_embedding IS NOT NULL AND r.id <> ALL(CAST(:skip AS uuid[])))))"
+    )
+
+    #: Clusters with no member vector and no child centroid that is staged or
+    #: can still be (``entity_embeddings.embedding`` is NOT NULL, so every
+    #: unskipped member row is claimable).
+    DEAD_CLUSTERS_SQL = (
+        "SELECT c.cluster_id FROM entity_clusters c "
+        "WHERE c.centroid IS NOT NULL AND c.embedding_next_model IS DISTINCT FROM :next "
+        "AND NOT EXISTS (SELECT 1 FROM entity_cluster_members m "
+        "  JOIN entity_embeddings ee ON ee.entity_id = m.entity_id "
+        "  WHERE m.cluster_id = c.cluster_id AND (ee.embedding_next_model = :next "
+        "    OR ee.entity_id <> ALL(CAST(:skip_ent AS uuid[])))) "
+        "AND NOT EXISTS (SELECT 1 FROM entity_clusters ch "
+        "  WHERE ch.parent_cluster_id = c.cluster_id AND ch.centroid IS NOT NULL "
+        "    AND (ch.embedding_next_model = :next "
+        "      OR ch.cluster_id <> ALL(CAST(:skip_cl AS uuid[]))))"
+    )
+
+    async def skip_dependents(self, nxt: str) -> int:
+        """Skip derived rows that have nothing left to derive from.
+
+        Without this, an episode whose traversal record was skipped, or a
+        cluster whose members were all skipped, stays in ``total`` and never
+        reaches ``done``, so the migration can never complete. Skipped like a
+        poison row: reported as unsourced and dropped at cutover. A dead leaf
+        can kill its parent, so clusters repeat until nothing new is found.
+        """
+        added = 0
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(self.DEAD_EPISODES_SQL),
+                    {"next": nxt, "skip": self._skipped_pks("trellion_traversal_records", nxt)},
+                )
+            ).fetchall()
+            added += self._skip_derived("trellion_episodes", rows, nxt)
+            for _ in range(16):  # cluster levels
+                rows = (
+                    await conn.execute(
+                        text(self.DEAD_CLUSTERS_SQL),
+                        {
+                            "next": nxt,
+                            "skip_ent": self._skipped_pks("entity_embeddings", nxt),
+                            "skip_cl": self._skipped_pks("entity_clusters", nxt),
+                        },
+                    )
+                ).fetchall()
+                n = self._skip_derived("entity_clusters", rows, nxt)
+                added += n
+                if n == 0:
+                    break
+        return added
+
+    def _skip_derived(self, table: str, rows, nxt: str) -> int:
+        n = 0
+        for (pk,) in rows:
+            k = (table, str(pk), nxt)
+            if k not in self._skipped:
+                self._skipped.add(k)
+                n += 1
+                log.warning("reembed.row_skipped", table=table, pk=str(pk), key=nxt,
+                            error="nothing left to derive it from")
+        return n
 
     async def _fill_text(self, spec: TableSpec, rec: SpaceRecord) -> int:
         nxt = rec.next_model or ""
@@ -511,11 +596,13 @@ class ReembedWorker:
 
     #: Clusters whose inputs are all staged. A leaf (has member rows) needs
     #: every member's vector re-embedded; a parent (no member rows) needs every
-    #: child centroid done. Selecting only READY clusters means nothing blocks
-    #: the scan and no cursor is needed.
+    #: child centroid done. Skipped inputs (``:skip_ent`` / ``:skip_cl``) are
+    #: not waited for. Selecting only READY clusters means nothing blocks the
+    #: scan and no cursor is needed.
     CLUSTER_READY_SQL = (
         "SELECT c.cluster_id, c.level FROM entity_clusters c "
-        "WHERE c.centroid IS NOT NULL AND c.embedding_next_model IS DISTINCT FROM :next AND ("
+        "WHERE c.centroid IS NOT NULL AND c.embedding_next_model IS DISTINCT FROM :next "
+        "AND c.cluster_id <> ALL(CAST(:skip_cl AS uuid[])) AND ("
         "  (EXISTS (SELECT 1 FROM entity_cluster_members m WHERE m.cluster_id = c.cluster_id)"
         "   AND EXISTS (SELECT 1 FROM entity_cluster_members m "
         "               JOIN entity_embeddings ee ON ee.entity_id = m.entity_id "
@@ -523,13 +610,15 @@ class ReembedWorker:
         "   AND NOT EXISTS (SELECT 1 FROM entity_cluster_members m "
         "               JOIN entity_embeddings ee ON ee.entity_id = m.entity_id "
         "               WHERE m.cluster_id = c.cluster_id "
-        "                 AND ee.embedding_next_model IS DISTINCT FROM :next))"
+        "                 AND ee.embedding_next_model IS DISTINCT FROM :next "
+        "                 AND ee.entity_id <> ALL(CAST(:skip_ent AS uuid[]))))"
         "  OR (NOT EXISTS (SELECT 1 FROM entity_cluster_members m WHERE m.cluster_id = c.cluster_id)"
         "   AND EXISTS (SELECT 1 FROM entity_clusters ch WHERE ch.parent_cluster_id = c.cluster_id "
-        "               AND ch.centroid IS NOT NULL)"
+        "               AND ch.centroid IS NOT NULL AND ch.embedding_next_model = :next)"
         "   AND NOT EXISTS (SELECT 1 FROM entity_clusters ch "
         "               WHERE ch.parent_cluster_id = c.cluster_id AND ch.centroid IS NOT NULL "
-        "                 AND ch.embedding_next_model IS DISTINCT FROM :next))"
+        "                 AND ch.embedding_next_model IS DISTINCT FROM :next "
+        "                 AND ch.cluster_id <> ALL(CAST(:skip_cl AS uuid[]))))"
         ") ORDER BY c.level, c.cluster_id LIMIT :limit FOR NO KEY UPDATE OF c SKIP LOCKED"
     )
 
@@ -542,7 +631,13 @@ class ReembedWorker:
             async with conn.begin():
                 ready = (
                     await conn.execute(
-                        text(self.CLUSTER_READY_SQL), {"next": nxt, "limit": self._batch}
+                        text(self.CLUSTER_READY_SQL),
+                        {
+                            "next": nxt,
+                            "limit": self._batch,
+                            "skip_ent": self._skipped_pks("entity_embeddings", nxt),
+                            "skip_cl": self._skipped_pks("entity_clusters", nxt),
+                        },
                     )
                 ).fetchall()
                 for cid, _level in ready:
@@ -567,11 +662,13 @@ class ReembedWorker:
                                 text(
                                     "SELECT embedding_next::text, member_count "
                                     "FROM entity_clusters WHERE parent_cluster_id = :c "
-                                    "AND centroid IS NOT NULL"
+                                    "AND centroid IS NOT NULL AND embedding_next_model = :next"
                                 ),
-                                {"c": cid},
+                                {"c": cid, "next": nxt},
                             )
                         ).fetchall()
+                        if not kids:
+                            continue  # nothing staged to derive from (raced a rewrite)
                         arr = np.array([_parse_vec(k[0]) for k in kids], dtype=np.float64)
                         w = np.array([max(int(k[1] or 0), 1) for k in kids], dtype=np.float64)
                         centroid = (arr * w[:, None]).sum(axis=0) / w.sum()
