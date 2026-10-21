@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Dependabot minor/patch auto-merge (mirrors noomesh/noomesh).
+#
+# For a Dependabot pull request whose highest semver change is a minor or a
+# patch, ask GitHub to merge it once the required checks pass (`gh pr merge
+# --auto`; with the merge queue on `dev` that enqueues it). Nothing here
+# approves, bypasses or weakens a check: if CI is red, nothing merges.
+#
+# NEVER auto-merged: majors, anything fetch-metadata cannot classify, and the
+# github-actions ecosystem (those bumps touch the workflows that build and
+# publish, so a person reads them).
+#
+# Trigger is `pull_request`, never `pull_request_target`: the job runs the
+# PR's own (Dependabot-authored) workflow definition with a token limited to
+# what `permissions:` grants, and no job here checks out or runs PR code.
+name: Dependabot auto-merge
+
+on:
+  pull_request:
+    branches: [ dev ]
+
+permissions:
+  contents: read
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]' && github.repository == 'personifAI/trellion'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+    - name: Dependabot metadata
+      id: meta
+      uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98   # v3.1.0
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Enable auto-merge for minor and patch updates
+      if: >-
+        (steps.meta.outputs.update-type == 'version-update:semver-minor'
+        || steps.meta.outputs.update-type == 'version-update:semver-patch')
+        && steps.meta.outputs.package-ecosystem != 'github_actions'
+        && !startsWith(github.head_ref, 'dependabot/github_actions/')
+      env:
+        PR_URL: ${{ github.event.pull_request.html_url }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh pr merge --auto --rebase "$PR_URL"
+
+    - name: Left for a person
+      if: >-
+        !((steps.meta.outputs.update-type == 'version-update:semver-minor'
+        || steps.meta.outputs.update-type == 'version-update:semver-patch')
+        && steps.meta.outputs.package-ecosystem != 'github_actions'
+        && !startsWith(github.head_ref, 'dependabot/github_actions/'))
+      run: |
+        echo "::notice::not auto-merged: update-type='${{ steps.meta.outputs.update-type }}' ecosystem='${{ steps.meta.outputs.package-ecosystem }}'"

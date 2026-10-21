@@ -10,6 +10,12 @@ on:
     branches: [ main, dev, staging ]
   pull_request:
     branches: [ main, dev, staging ]
+  # GitHub's merge queue on `dev`: the queue builds a merge group (the PR(s) on the
+  # branch tip, on a gh-readonly-queue/* branch) and waits for the required
+  # checks to pass on it before merging. Without this trigger the required
+  # checks never report on the group and the queue times out.
+  merge_group:
+    types: [checks_requested]
   # Lets a run that never started be re-triggered without a new commit.
   workflow_dispatch:
 
