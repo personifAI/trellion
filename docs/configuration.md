@@ -71,7 +71,7 @@ named, per vector:
   table holding vectors from two models never ranks one against the other. The
   current model is the query vector's own (it came from the embed response),
   else the space's record from `GET /api/external/capabilities`
-  (`embedding.spaces`), cached for 30 seconds. If neither is known (gateway
+  (`embeddings.spaces`), cached for 30 seconds. If neither is known (gateway
   unreachable, no cached record) the filter is **dropped** and logged once
   (`embedding_space.lookup_failed`): a failed lookup never empties a result.
 - Vectors written before migration 106 have a NULL model. The embedder loop

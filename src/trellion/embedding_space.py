@@ -10,7 +10,7 @@ talks to the capabilities door about embeddings:
   ``knowledge``). Every embed call sends it as ``model``; the gateway maps a
   space to the model that currently serves it (noomesh followup i150);
 * a short-TTL cached read of that space's record from
-  ``GET /api/external/capabilities`` (``embedding.spaces``): the current
+  ``GET /api/external/capabilities`` (``embeddings.spaces``): the current
   model, the vector width and any running re-embed migration;
 * the **current model**, which every similarity query filters on
   (``embedding_model = <current model>``) so a table holding vectors from two
@@ -136,7 +136,7 @@ def gateway_url() -> str:
 
 @dataclass(frozen=True)
 class SpaceRecord:
-    """One entry of ``capabilities.embedding.spaces``."""
+    """One entry of ``capabilities.embeddings.spaces``."""
 
     space: str
     model: str
@@ -159,7 +159,7 @@ class SpaceRecord:
 
 def parse_space(payload: dict, space: str) -> Optional[SpaceRecord]:
     """Pick ``space`` out of a capabilities payload; None when absent."""
-    spaces = ((payload or {}).get("embedding") or {}).get("spaces") or []
+    spaces = ((payload or {}).get("embeddings") or {}).get("spaces") or []
     for s in spaces:
         if isinstance(s, dict) and s.get("space") == space and s.get("model"):
             mig = s.get("migration")
