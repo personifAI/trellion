@@ -41,11 +41,14 @@ Re-embedding, table by table (``kind``):
 
 UNSOURCED rows (concept centroids, episodes with no traversal record, and rows
 whose text the embedder rejects even when sent alone) are never invented. They
-are left out of ``done``/``total`` and reported per table as ``unsourced``;
-at cutover their vector and model are set to NULL (an old-model vector must
-not sit under the new model), so they drop out of search until whatever owns
-them regenerates them on its next run. Nothing in trellion, trellion-intel or
-trellion-evolve writes concept centroids.
+are left out of ``done``/``total`` and reported per table as ``unsourced``.
+At cutover a row with no source has its vector and model set to NULL (an
+old-model vector must not sit under the new model), so it drops out of search
+until whatever owns it regenerates it on its next run. Nothing in trellion,
+trellion-intel or trellion-evolve writes concept centroids. A SKIPPED text row
+(or an episode skipped with it) still has a source: it keeps its old vector
+under its old model label, out of search, and the stale sweep retries it with
+the new model after the migration (see :meth:`ReembedWorker.skipped_null_sql`).
 
 A skipped row also skips what is DERIVED from it, or the migration could never
 complete (the gateway refuses ``complete`` until every table's done==total):
@@ -793,11 +796,25 @@ class ReembedWorker:
 
     @staticmethod
     def skipped_null_sql(spec: TableSpec) -> str:
-        """Rows skipped for this migration: dropped, not left under the old model.
+        """Rows skipped for this migration, at cutover.
+
+        ``text`` and ``episode`` rows keep their old vector under its OLD model
+        label (only the staging is cleared). Every read filters by model, so
+        the row is out of search either way, and the stale sweep re-embeds it
+        with the new model once the migration is over (an episode copies from
+        its healed traversal record). Nulling it would lose it for good:
+        nothing else re-embeds a traversal record.
 
         ``entity_embeddings.embedding`` is NOT NULL, so its row is deleted (the
-        graph embedder treats "no row" as stale and regenerates it).
+        graph embedder treats "no row" as stale and regenerates it). A cluster
+        is nulled; the owner's next clustering run rebuilds it.
         """
+        if spec.kind in ("text", "episode"):
+            return (
+                f"UPDATE {spec.name} SET embedding_next = NULL, embedding_next_model = NULL "
+                f"WHERE {spec.pk} = ANY(CAST(:ids AS uuid[])) "
+                f"AND embedding_next_model IS DISTINCT FROM :next"
+            )
         if spec.name == "entity_embeddings":
             return (
                 "DELETE FROM entity_embeddings WHERE entity_id = ANY(CAST(:ids AS uuid[])) "
