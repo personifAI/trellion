@@ -14,7 +14,7 @@ dependencies = [
     # The interface trellion offers add-ons (Apache-2.0, its own repo). Pinned
     # by full commit SHA, never by tag alone: tags can be moved.
     # v0.1.0
-    "trellion-protocols @ git+https://github.com/personifAI/trellion-protocols.git@2854dad7874696720c10e711288011d478de2280",
+    "trellion-protocols @ git+https://github.com/personifAI/trellion-protocols.git@2da35d20bbe693b38616da626fd75b2d05d58e91",
     # I/O + orchestration
     "typer>=0.12",
     "pydantic>=2.7",
@@ -22,7 +22,7 @@ dependencies = [
     "pyyaml>=6.0",
     "rich>=13.7",
     "structlog>=24.0",
-    "orjson>=3.9",
+    "orjson>=3.11.6",
     # LLM + embedding clients (OpenAI-compatible, works with vLLM + TEI)
     "openai>=1.40",
     "httpx>=0.27",
@@ -62,7 +62,7 @@ clustering = [
     "igraph>=0.11",
 ]
 dev = [
-    "pytest>=8.2",
+    "pytest>=9.0.3",
     "pytest-asyncio>=0.23",
     # Required by the database-backed tests (TRELLION_TEST_DSN). Without it they
     # ERROR importing the asyncpg dialect rather than skipping cleanly, which
@@ -85,7 +85,7 @@ graph-igraph = [
 ]
 transport = [
     # Parquet shard packaging (proposal 06 phase 6.C)
-    "pyarrow>=15.0",
+    "pyarrow>=23.0.1",
 ]
 all = [
     "trellion[clustering,rag,video,graph-igraph,transport]",
