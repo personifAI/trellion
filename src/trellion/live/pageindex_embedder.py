@@ -34,6 +34,7 @@ import httpx
 import structlog
 
 from trellion import embedding_space
+from trellion.live import embed_bulk as _bulk
 from trellion.live._tls import ssl_verify, client_cert
 from trellion.live.embed_throttle import EmbedThrottle, EmbedUnavailable, get_throttle
 from trellion.live.pageindex_store import PageIndexStore
@@ -110,6 +111,8 @@ class PageIndexEmbedder:
         # Provenance upkeep + space re-embed (live/reembed.py). Built on
         # start(), once the store's engine is known to be usable.
         self._reembed: Optional[ReembedWorker] = None
+        # Set once a 404/405 says the gateway has no bulk job route.
+        self._bulk_unsupported = False
 
     # ------------------------------------------------------------------
     # Embedding calls (TEI or Ollama)
@@ -187,6 +190,59 @@ class PageIndexEmbedder:
             what="reembed", count=len(texts),
         )
 
+    async def embed_bulk(
+        self, texts: list[str], *, model: Optional[str] = None
+    ) -> embedding_space.Embeddings:
+        """Embed BACKGROUND work, through the gateway's bulk job route.
+
+        Only for callers that are not waiting on the vector (the re-embed, the
+        page/chunk backlog, the graph entity sweep); a query uses
+        :meth:`embed_text` / :meth:`embed_batch`. ``model`` names the space
+        (default: the configured one; the re-embed passes ``<space>@next``).
+
+        With ``NOO_EMBED_BULK`` off this is exactly the synchronous call. With
+        it on, the texts go as jobs and the throttle still wraps the whole
+        thing, so a 429/503 ends in :class:`EmbedUnavailable` (with its
+        Retry-After) and a failed job is an ordinary error. A gateway without
+        the route (404/405) is answered by the synchronous call, logged once.
+        """
+        if not texts:
+            return embedding_space.Embeddings([])
+        assert self._client is not None
+        if not _bulk.enabled() or self._bulk_unsupported:
+            return await self.throttle.call(
+                lambda: self._embed_gateway(texts, model),
+                what="reembed" if model else "batch", count=len(texts),
+            )
+
+        async def attempt() -> embedding_space.Embeddings:
+            try:
+                return await _bulk.embed_bulk(
+                    self._client, self.embedding_url, texts,
+                    model or embedding_space.space_name(),
+                )
+            except _bulk.BulkUnsupported as exc:
+                if not self._bulk_unsupported:
+                    log.warning(
+                        "embed_bulk.gateway_without_job_route",
+                        status=str(exc),
+                        note="falling back to synchronous embedding",
+                    )
+                self._bulk_unsupported = True
+                return await self._embed_gateway(texts, model)
+
+        try:
+            return await self.throttle.call(
+                attempt, what="bulk", count=len(texts)
+            )
+        except _bulk.BulkJobTimeout as exc:
+            self.throttle.record_failure()
+            raise EmbedUnavailable(f"bulk_timeout: {exc}", 1) from exc
+
+    async def _embed_next_bulk(self, texts: list[str]) -> embedding_space.Embeddings:
+        """The re-embed's ``embed_next``: the space's NEXT model, in bulk."""
+        return await self.embed_bulk(texts, model=embedding_space.next_alias())
+
     async def _embed_text_gateway(self, text: str) -> list[float]:
         out = await self._embed_gateway([text])
         return out[0] if out else []
@@ -229,7 +285,7 @@ class PageIndexEmbedder:
                 if not pages:
                     return 0
                 stage = "embed"
-                embeddings = await self.embed_batch([p["text"] for p in pages])
+                embeddings = await self.embed_bulk([p["text"] for p in pages])
                 stage = "store"
                 stored = await claim.store(
                     [(p["page_id"], e) for p, e in zip(pages, embeddings)]
@@ -272,7 +328,7 @@ class PageIndexEmbedder:
                 if not chunks:
                     return 0
                 stage = "embed"
-                embeddings = await self.embed_batch([c["text"] for c in chunks])
+                embeddings = await self.embed_bulk([c["text"] for c in chunks])
                 stage = "store"
                 stored = await claim.store(
                     [(c["chunk_id"], e) for c, e in zip(chunks, embeddings)]
@@ -386,7 +442,7 @@ class PageIndexEmbedder:
         engine = getattr(self.store, "_engine", None)
         self._reembed = (
             ReembedWorker(
-                engine, self._embed_next, embed_live=self.embed_batch,
+                engine, self._embed_next_bulk, embed_live=self.embed_bulk,
                 batch_size=self.batch_size,
             )
             if engine is not None
