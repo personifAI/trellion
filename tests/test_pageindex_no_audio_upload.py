@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
 """RAG ingest never sends audio to Google.
 
 markitdown's AudioConverter transcribes .wav/.mp3 with SpeechRecognition's

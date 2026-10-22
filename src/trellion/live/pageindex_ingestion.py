@@ -3,8 +3,8 @@
 
 """Document ingestion agent for PageIndex.
 
-Accepts PDF, Markdown, HTML, Office (DOCX/PPTX/XLSX), and plain text
-documents.  When ``markitdown`` is installed, all supported formats
+Accepts PDF, Markdown, HTML, Office (DOCX/PPTX/XLSX), plain text and audio
+(transcribed by the stack's own STT through the gateway) documents.  When ``markitdown`` is installed, all supported formats
 are first converted to Markdown via MarkItDown (with optional local-LLM
 image descriptions), then split and chunked.  Falls back to built-in
 parsers when MarkItDown is unavailable.
@@ -264,6 +264,149 @@ def _without_audio_converter(md: Any) -> Any:
     ]
     return md
 
+
+# ── Audio: transcribed by the stack's own STT, through the gateway ────────
+#
+# markitdown never sees audio (see `_without_audio_converter`). Audio files go
+# to the gateway's `POST /api/voice/transcribe/detailed`, which proxies the
+# STT provider the operator configured (the voice overlay's noo-whisper by
+# default). There is no other path: if the gateway cannot transcribe, the
+# ingest of that file fails and says why.
+
+#: The extensions the stack's whisper decodes (the `noo voice transcribe`
+#: MIME table, noo-cli/src/commands/voice.rs). The MIME is advisory — the
+#: service sniffs the container from the bytes and the filename suffix.
+AUDIO_MIME_TYPES: dict[str, str] = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".webm": "audio/webm",
+}
+
+#: The gateway's body limit on the transcribe routes
+#: (`TRANSCRIBE_BODY_LIMIT`, gateway-rust/src/routes/communication.rs).
+GATEWAY_TRANSCRIBE_BODY_LIMIT = 10 * 1024 * 1024
+#: The limit applies to the whole multipart body, so the file itself must
+#: leave room for the part headers and boundaries.
+_MULTIPART_HEADROOM = 16 * 1024
+MAX_AUDIO_BYTES = GATEWAY_TRANSCRIBE_BODY_LIMIT - _MULTIPART_HEADROOM
+
+#: The gateway waits 120 s on the STT provider; a little longer here so the
+#: gateway's own answer (a 502 naming the provider) arrives instead of a
+#: client-side timeout. One request per file, no retries.
+TRANSCRIBE_TIMEOUT_SECS = 150.0
+
+TRANSCRIBE_PATH = "/api/voice/transcribe/detailed"
+
+#: Test seam: an ``httpx.MockTransport`` here exercises the real client
+#: construction, auth flow and multipart encoding (gateway_auth has the same
+#: seam for the same reason).
+_transcribe_transport: httpx.AsyncBaseTransport | None = None
+
+
+class AudioTranscriptionError(ValueError):
+    """An audio file could not be transcribed by this stack, so it was not
+    ingested. The message names the cause and the fix; nothing falls back to
+    any other transcription service."""
+
+
+_VOICE_OFF = (
+    "voice transcription is off on this stack; enable voice to ingest audio"
+)
+
+
+def _gateway_error_detail(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+        if isinstance(body, dict) and body.get("error"):
+            return str(body["error"])[:300]
+    except Exception:  # noqa: BLE001 — a non-JSON error body is still a body
+        pass
+    return (resp.text or "").strip()[:300]
+
+
+def _transcription_failure(name: str, resp: httpx.Response) -> AudioTranscriptionError:
+    status = resp.status_code
+    detail = _gateway_error_detail(resp)
+    suffix = f" (gateway: {detail})" if detail else ""
+    if status in (401, 403):
+        return AudioTranscriptionError(
+            f"cannot ingest {name}: the gateway refused trellion's service credential on "
+            f"{TRANSCRIBE_PATH} (HTTP {status}), so the audio was not transcribed{suffix}"
+        )
+    if status == 413:
+        return AudioTranscriptionError(
+            f"cannot ingest {name}: the gateway refused the upload as too large (HTTP 413); "
+            f"its transcribe limit is {GATEWAY_TRANSCRIBE_BODY_LIMIT // (1024 * 1024)} MiB"
+        )
+    if status == 404 or status in (502, 503, 504):
+        return AudioTranscriptionError(
+            f"cannot ingest {name}: {_VOICE_OFF} (HTTP {status} from {TRANSCRIBE_PATH}){suffix}"
+        )
+    if status == 400:
+        return AudioTranscriptionError(
+            f"cannot ingest {name}: the gateway could not read the audio (HTTP 400){suffix}"
+        )
+    return AudioTranscriptionError(
+        f"cannot ingest {name}: transcription failed (HTTP {status} from {TRANSCRIBE_PATH}){suffix}"
+    )
+
+
+def _fmt_ts(secs: float) -> str:
+    secs = max(int(secs), 0)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _transcript_pages(body: dict) -> tuple[list[str], str]:
+    """Pages and full text from a transcribe reply.
+
+    With segments, consecutive segments are packed into pages of at most
+    ``PAGE_SPLIT_CHARS``, each headed by its time range, so a long recording
+    is many retrievable pages (and a hit says where in the recording it is)
+    rather than one page whose embedding sees only its first minutes. Without
+    segments, the text is split like any plain text.
+    """
+    text = str(body.get("text") or "").strip()
+    segments = body.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return _split_plain(text), text
+
+    pages: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
+    start = end = 0.0
+
+    def flush() -> None:
+        if buf:
+            pages.append(f"[{_fmt_ts(start)}–{_fmt_ts(end)}]\n" + " ".join(buf))
+
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_text = str(seg.get("text") or "").strip()
+        if not seg_text:
+            continue
+        seg_start = float(seg.get("start") or 0.0)
+        seg_end = float(seg.get("end") or seg_start)
+        if buf and buf_len + len(seg_text) + 1 > PAGE_SPLIT_CHARS:
+            flush()
+            buf, buf_len = [], 0
+        if not buf:
+            start = seg_start
+        buf.append(seg_text)
+        buf_len += len(seg_text) + 1
+        end = seg_end
+    flush()
+
+    if not pages:
+        return _split_plain(text), text
+    return pages, text or "\n".join(pages)
+
+
 class DocumentIngestor:
     """Ingests documents into PageIndex via PageIndexStore.
 
@@ -281,8 +424,10 @@ class DocumentIngestor:
         ".jpg", ".jpeg", ".png",
         # No audio: markitdown transcribes .wav/.mp3 with SpeechRecognition's
         # recognize_google, i.e. it uploads the recording to Google's web
-        # speech API. Audio is refused here and markitdown's AudioConverter is
-        # removed below (zip members reuse the same converter list).
+        # speech API. Audio goes to the stack's own STT instead
+        # (AUDIO_MIME_TYPES, `_ingest_audio_file`) and markitdown's
+        # AudioConverter is removed below (zip members reuse the same
+        # converter list, so audio inside a .zip is never transcribed).
     }
 
     def __init__(
@@ -440,6 +585,112 @@ class DocumentIngestor:
         )
 
     # ------------------------------------------------------------------
+    # Audio
+    # ------------------------------------------------------------------
+
+    async def _transcribe(self, file_path: Path) -> dict:
+        """POST one audio file to the gateway's transcribe route; return the
+        reply JSON. Raises :class:`AudioTranscriptionError` on any failure.
+
+        One request, bounded size and time. The service credential and mTLS
+        are the same as every other trellion → gateway call
+        (``GatewayHmacAuth``, ``ssl_verify()``, ``client_cert()``).
+        """
+        from trellion.live.gateway_auth import GatewayCredentialMissing, GatewayHmacAuth
+
+        name = file_path.name
+        size = file_path.stat().st_size
+        if size == 0:
+            raise AudioTranscriptionError(f"cannot ingest {name}: the audio file is empty")
+        if size > MAX_AUDIO_BYTES:
+            raise AudioTranscriptionError(
+                f"cannot ingest {name}: {size / (1024 * 1024):.1f} MiB is over the "
+                f"{MAX_AUDIO_BYTES / (1024 * 1024):.2f} MiB audio limit (the gateway's "
+                f"transcribe routes accept at most "
+                f"{GATEWAY_TRANSCRIBE_BODY_LIMIT // (1024 * 1024)} MiB per upload); "
+                f"split the recording or re-encode it at a lower bitrate"
+            )
+        audio = file_path.read_bytes()
+        mime = AUDIO_MIME_TYPES.get(file_path.suffix.lower(), "application/octet-stream")
+        gateway = os.environ.get("NOO_GATEWAY_URL", "https://gateway:8080").rstrip("/")
+        url = f"{gateway}{TRANSCRIBE_PATH}"
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(TRANSCRIBE_TIMEOUT_SECS, connect=10.0),
+                verify=ssl_verify(),
+                cert=client_cert(),
+                auth=GatewayHmacAuth(),
+                transport=_transcribe_transport,
+            ) as client:
+                resp = await client.post(url, files={"file": (name, audio, mime)})
+        except GatewayCredentialMissing as exc:
+            raise AudioTranscriptionError(f"cannot ingest {name}: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            # The local refusal circuit (GatewayRefused) answers with the
+            # status the gateway gave moments ago, without a request.
+            raise _transcription_failure(name, exc.response) from exc
+        except httpx.TimeoutException as exc:
+            raise AudioTranscriptionError(
+                f"cannot ingest {name}: the gateway did not finish transcribing within "
+                f"{TRANSCRIBE_TIMEOUT_SECS:.0f}s"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise AudioTranscriptionError(
+                f"cannot ingest {name}: the gateway is unreachable at {gateway} "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+
+        if resp.status_code != 200:
+            err = _transcription_failure(name, resp)
+            log.warning("audio_transcription_failed", file=str(file_path), status=resp.status_code, reason=str(err))
+            raise err
+        try:
+            body = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise AudioTranscriptionError(
+                f"cannot ingest {name}: the gateway's transcribe reply was not JSON"
+            ) from exc
+        if not isinstance(body, dict):
+            raise AudioTranscriptionError(
+                f"cannot ingest {name}: the gateway's transcribe reply was not an object"
+            )
+        return body
+
+    async def _ingest_audio_file(
+        self,
+        file_path: Path,
+        title: Optional[str] = None,
+        source_uri: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> str:
+        """Transcribe an audio file with the stack's STT and ingest the
+        transcript, one page per ~``PAGE_SPLIT_CHARS`` of speech, each headed
+        by its time range."""
+        title = title or file_path.stem
+        body = await self._transcribe(file_path)
+        pages, full_text = _transcript_pages(body)
+        if not full_text.strip():
+            raise AudioTranscriptionError(
+                f"cannot ingest {file_path.name}: the transcript is empty (no speech recognised)"
+            )
+        log.info(
+            "audio_transcribed",
+            file=str(file_path),
+            chars=len(full_text),
+            pages=len(pages),
+            language=body.get("language"),
+            duration=body.get("duration"),
+        )
+        return await self._ingest_pages(
+            pages=pages,
+            full_text=full_text,
+            title=title,
+            source_uri=source_uri or str(file_path),
+            metadata=metadata,
+        )
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -453,8 +704,11 @@ class DocumentIngestor:
         """Ingest a file (auto-detect type from extension).
 
         Conversion priority:
-        1. MarkItDown (if installed) — handles Office, images, audio, etc.
-        2. Built-in parsers — PDF (pymupdf), Markdown, HTML, plain text.
+        1. Audio (AUDIO_MIME_TYPES) — transcribed by the stack's own STT
+           through the gateway's ``/api/voice/transcribe/detailed``; never
+           markitdown, never any other service.
+        2. MarkItDown (if installed) — handles Office, images, etc.
+        3. Built-in parsers — PDF (pymupdf), Markdown, HTML, plain text.
 
         *source_uri* defaults to *file_path* but callers should pass the
         **original** file path when the file has been copied to a working
@@ -469,6 +723,10 @@ class DocumentIngestor:
         suffix = file_path.suffix.lower()
         title = title or file_path.stem
         source_uri = source_uri or str(file_path)
+
+        # --- Audio: the stack's own STT via the gateway, never markitdown ---
+        if suffix in AUDIO_MIME_TYPES:
+            return await self._ingest_audio_file(file_path, title=title, source_uri=source_uri, metadata=metadata)
 
         # --- MarkItDown path for formats we can't handle natively ---
         if suffix in self._MARKITDOWN_EXTENSIONS:
