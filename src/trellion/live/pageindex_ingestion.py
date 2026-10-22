@@ -242,6 +242,28 @@ def _read_pdf(file_path: Path) -> list[str]:
     return pages
 
 
+
+def _without_audio_converter(md: Any) -> Any:
+    """Remove markitdown's AudioConverter, or refuse markitdown entirely.
+
+    markitdown's AudioConverter transcribes speech with SpeechRecognition's
+    ``recognize_google``: the recording is uploaded to Google's web speech API
+    (no consent, no opt-out, against noomesh's no-vendor-telemetry rule). The
+    zip converter converts archive members with the same converter list, so
+    removing it there also covers audio inside a .zip. If this markitdown has
+    no ``_converters`` list to filter, fail closed: return None so documents
+    fall back to the built-in parsers rather than risk an upload.
+    """
+    regs = getattr(md, "_converters", None)
+    if not isinstance(regs, list):
+        log.error("markitdown_audio_guard_unavailable", reason="no _converters list; markitdown disabled")
+        return None
+    md._converters = [
+        r for r in regs
+        if type(getattr(r, "converter", r)).__name__ != "AudioConverter"
+    ]
+    return md
+
 class DocumentIngestor:
     """Ingests documents into PageIndex via PageIndexStore.
 
@@ -257,7 +279,10 @@ class DocumentIngestor:
         ".docx", ".pptx", ".xlsx", ".xls", ".csv",
         ".json", ".xml", ".zip",
         ".jpg", ".jpeg", ".png",
-        ".wav", ".mp3",
+        # No audio: markitdown transcribes .wav/.mp3 with SpeechRecognition's
+        # recognize_google, i.e. it uploads the recording to Google's web
+        # speech API. Audio is refused here and markitdown's AudioConverter is
+        # removed below (zip members reuse the same converter list).
     }
 
     def __init__(
@@ -303,7 +328,7 @@ class DocumentIngestor:
                     kwargs["llm_model"] = llm_model
                 except ImportError:
                     pass  # openai package not installed — skip LLM descriptions
-            self._markitdown = MarkItDown(**kwargs)
+            self._markitdown = _without_audio_converter(MarkItDown(**kwargs))
             log.info(
                 "markitdown_available",
                 llm_enabled=bool(kwargs.get("llm_client")),
