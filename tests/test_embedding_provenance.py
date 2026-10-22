@@ -903,14 +903,22 @@ async def test_a_poison_row_is_retried_alone_then_skipped_and_the_migration_comp
     await w.report(nxt, cutover_done=False)
     # the skipped row counts as unsourced, so done can still reach total
     assert gw.puts[-1]["tables"]["page_embeddings"]["unsourced"] >= 1
-    # cutover drops the skipped row's old-model vector instead of leaving it
+    # cutover keeps the skipped row's vector under its OLD label (out of search:
+    # reads filter by model), not dropped and not relabelled
     gw.migration = {**filling(tag), "state": "cutover"}
     fresh_space()
     await w.run_pass()
-    got = {r[0]: r[1] for r in await _fetch(
-        store, "SELECT page_id::text, embedding_model FROM page_embeddings "
-        "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)}
-    assert got == {pids[0]: nxt, pids[1]: None, pids[2]: nxt}
+    sql = ("SELECT page_id::text, embedding_model, embedding IS NOT NULL FROM page_embeddings "
+           "WHERE page_id = ANY(CAST(:ids AS uuid[]))")
+    got = {r[0]: (r[1], r[2]) for r in await _fetch(store, sql, ids=pids)}
+    assert got == {pids[0]: (nxt, True), pids[1]: (f"m-{tag}", True), pids[2]: (nxt, True)}
+    # once the migration is over, the stale sweep retries it with the new model
+    gw.model, gw.migration, gw.poison = nxt, None, set()
+    fresh_space()
+    after = ReembedWorker(store.engine, e._embed_next, embed_live=e.embed_batch, batch_size=64)
+    await after.run_pass()
+    got = {r[0]: (r[1], r[2]) for r in await _fetch(store, sql, ids=pids)}
+    assert got[pids[1]] == (nxt, True)
 
 
 class _Ticks:
@@ -959,9 +967,24 @@ async def test_an_episode_whose_traversal_record_is_skipped_does_not_block_compl
         gw.migration = {**filling(tag), "state": "cutover"}
         fresh_space()
         await w.run_pass()
-        got = await _fetch(store, "SELECT embedding IS NULL, embedding_model IS NULL "
-                           "FROM trellion_episodes WHERE id = CAST(:f AS uuid)", f=frame)
-        assert tuple(got[0]) == (True, True)  # dropped, not left under the old model
+
+        async def models():
+            ep = await _fetch(store, "SELECT embedding IS NOT NULL, embedding_model "
+                              "FROM trellion_episodes WHERE id = CAST(:f AS uuid)", f=frame)
+            tr = await _fetch(store, "SELECT query_embedding IS NOT NULL, embedding_model "
+                              "FROM trellion_traversal_records WHERE id = CAST(:t AS uuid)", t=trav)
+            return tuple(ep[0]), tuple(tr[0])
+
+        # both keep their vector under the OLD label: out of search, not lost
+        assert await models() == ((True, f"m-{tag}"), (True, f"m-{tag}"))
+        # after the migration the stale sweep re-embeds the record, then the
+        # episode copies from it (nothing else would ever re-embed the record)
+        gw.model, gw.migration, gw.poison = nxt, None, set()
+        fresh_space()
+        e = make_embedder(store, gw)
+        after = ReembedWorker(store.engine, e._embed_next, embed_live=e.embed_batch, batch_size=64)
+        await after.run_pass()
+        assert await models() == ((True, nxt), (True, nxt))
     finally:
         await store_exec(store, "DELETE FROM trellion_traversal_records WHERE id = CAST(:t AS uuid)", t=trav)
         await store_exec(store, "DELETE FROM trellion_episodes WHERE id = CAST(:f AS uuid)", f=frame)
