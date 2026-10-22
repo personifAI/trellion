@@ -33,9 +33,11 @@ from typing import Optional
 import httpx
 import structlog
 
+from trellion import embedding_space
 from trellion.live._tls import ssl_verify, client_cert
 from trellion.live.embed_throttle import EmbedThrottle, EmbedUnavailable, get_throttle
 from trellion.live.pageindex_store import PageIndexStore
+from trellion.live.reembed import ReembedWorker
 
 log = structlog.get_logger(__name__)
 
@@ -70,6 +72,7 @@ class PageIndexEmbedder:
         # state. Retry/backoff on 503s lives there, not in tenacity here.
         self.throttle = throttle or get_throttle()
         self.embedding_url = embedding_url.rstrip("/")
+        embedding_space.configure_url(self.embedding_url)
         self.messaging = messaging  # ClusterMessaging | None
         self.batch_size = batch_size
         # Transport is the gateway, always. `backend` and `capability_router`
@@ -104,6 +107,9 @@ class PageIndexEmbedder:
         self._client: Optional[httpx.AsyncClient] = None
         self._wake_event = asyncio.Event()
         self._stop_event = asyncio.Event()
+        # Provenance upkeep + space re-embed (live/reembed.py). Built on
+        # start(), once the store's engine is known to be usable.
+        self._reembed: Optional[ReembedWorker] = None
 
     # ------------------------------------------------------------------
     # Embedding calls (TEI or Ollama)
@@ -155,16 +161,31 @@ class PageIndexEmbedder:
     # writing vectors back). Rust decides WHERE it goes. The extra hop is
     # loopback and negligible against model inference.
 
-    async def _embed_gateway(self, inputs: list[str]) -> list[list[float]]:
+    async def _embed_gateway(
+        self, inputs: list[str], model: Optional[str] = None
+    ) -> embedding_space.Embeddings:
+        """POST one embeddings call, ALWAYS naming the space as ``model``.
+
+        ``model`` defaults to the configured space (TRELLION_EMBEDDING_SPACE);
+        the re-embed passes ``"<space>@next"``. The result is a list of
+        vectors that also carries the model the RESPONSE named (``.model``,
+        and on each vector), which is what a writer records as provenance.
+        """
         resp = await self._client.post(
             f"{self.embedding_url}/api/external/embeddings",
-            json={"input": inputs},
+            json={"input": inputs, "model": model or embedding_space.space_name()},
         )
         resp.raise_for_status()
-        data = resp.json()
-        # OpenAI shape. Sort by index — the contract does not promise order.
-        rows = sorted(data.get("data", []), key=lambda d: d.get("index", 0))
-        return [r.get("embedding", []) for r in rows]
+        # OpenAI shape, sorted by index (the contract does not promise order).
+        return embedding_space.from_response(resp.json())
+
+    async def _embed_next(self, texts: list[str]) -> embedding_space.Embeddings:
+        """Embed with the space's NEXT model (a running migration)."""
+        assert self._client is not None
+        return await self.throttle.call(
+            lambda: self._embed_gateway(texts, embedding_space.next_alias()),
+            what="reembed", count=len(texts),
+        )
 
     async def _embed_text_gateway(self, text: str) -> list[float]:
         out = await self._embed_gateway([text])
@@ -362,6 +383,16 @@ class PageIndexEmbedder:
 
         await self._subscribe_doc_parsed()
 
+        engine = getattr(self.store, "_engine", None)
+        self._reembed = (
+            ReembedWorker(
+                engine, self._embed_next, embed_live=self.embed_batch,
+                batch_size=self.batch_size,
+            )
+            if engine is not None
+            else None
+        )
+
         self._task = asyncio.create_task(self._run_loop(interval))
         log.info(
             "pageindex_embedder_started",
@@ -434,6 +465,26 @@ class PageIndexEmbedder:
                     pass
             while not self._stop_requested:
                 total = 0
+
+                # Provenance upkeep and any running re-embed. Never fatal: a
+                # failure here must not stop ordinary embedding.
+                swapping = False
+                if self._reembed is not None:
+                    try:
+                        total += await self._reembed.run_pass()
+                        swapping = await self._reembed.in_cutover()
+                    except Exception:
+                        log.exception("reembed_pass_failed")
+
+                if self._stop_requested:
+                    break
+
+                # While the space is being swapped to its new model, hold
+                # ordinary writes: a vector embedded by the OLD model and
+                # written after the swap would be stranded.
+                if swapping:
+                    await self._rest(interval)
+                    continue
 
                 # Pages first (primary retrieval unit)
                 pages_done = await self.process_unembedded_pages(self.batch_size)

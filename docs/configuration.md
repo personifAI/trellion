@@ -49,6 +49,82 @@ These are read by the noomesh stack's worker pool and passed into `PageIndexRAG(
 | `PAGEINDEX_DSN` | none | Postgres DSN. The worker pool prefers it over `DATABASE_URL`; the `trellion` CLI reads `--dsn`, then `DATABASE_URL`, then `PAGEINDEX_DSN`; the migration env reads it after `NOO_MIGRATIONS_DSN`. | yes: runtime role `noo_app`, `search_path=mesh,public,trellion`, verify-full TLS |
 | `PAGEINDEX_EMBEDDING_EXTRA_URLS` | none | Gateway-side only (`gateway-rust/src/embedding_client.rs`); trellion does not read it. Listed because it sits next to the others. | no |
 
+## Embedding space, provenance and re-embed (`TRELLION_EMBEDDING_SPACE`)
+
+| Variable | Default | Effect | Stack sets |
+|---|---|---|---|
+| `TRELLION_EMBEDDING_SPACE` | `knowledge` | The gateway embedding **space** trellion's vectors live in. Every embed call (page/chunk embedder, entry worker, episode embedder) sends it as `model` on `POST /api/external/embeddings`. Read only by `embedding_space.py`. | no |
+
+The gateway maps a space to the one model that serves it (`noo_embedding_spaces`);
+trellion never names a model. What it does record is the model the **response**
+named, per vector:
+
+- Every vector column has `embedding_model` and `embedding_dim` beside it
+  (`chunk_embeddings`, `page_embeddings`, `entity_embeddings`, `entity_clusters`
+  centroids, `noo_entries`, `trellion_concepts` centroids,
+  `trellion_traversal_records.query_embedding`, `trellion_episodes`; migration
+  `106_embedding_provenance` added the pair to `trellion_episodes`). A cluster
+  centroid takes the model of the vectors it was averaged from; a caller that
+  knows it passes the centroid as `embedding_space.Vector(values, model)`,
+  otherwise the space's current model is recorded.
+- **Every similarity query filters `embedding_model = <current model>`**, so a
+  table holding vectors from two models never ranks one against the other. The
+  current model is the query vector's own (it came from the embed response),
+  else the space's record from `GET /api/external/capabilities`
+  (`embeddings.spaces`), cached for 30 seconds. If neither is known (gateway
+  unreachable, no cached record) the filter is **dropped** and logged once
+  (`embedding_space.lookup_failed`): a failed lookup never empties a result.
+- Vectors written before migration 106 have a NULL model. The embedder loop
+  labels them with the space's current model at start (then every five
+  minutes): every pre-provenance vector came from the default space. It is a
+  batched `UPDATE ... WHERE embedding_model IS NULL AND <vector> IS NOT NULL`,
+  idempotent and restart-safe, and is skipped during a cutover.
+
+### Re-embedding a space into a new model
+
+When the operator starts a migration (`noo cluster embedding-space migrate`),
+the space's capabilities entry carries `migration.state`. The embedder loop
+(`live/reembed.py`) follows it:
+
+| State | What trellion does |
+|---|---|
+| none (cancelled or finished) | Clears leftover `embedding_next` / `embedding_next_model` staging columns in batches. |
+| `filling` | Per table, in claimed batches (`FOR NO KEY UPDATE SKIP LOCKED`), re-embeds rows whose `embedding_next_model` is not the migration's `next_model`, with `model = "<space>@next"`, into `embedding_next`. The live column keeps serving. Rows written during the migration are picked up by the same scan. Progress goes to `PUT /api/external/embedding-spaces/{space}/migration` about every 30 seconds. |
+| `cutover` | Ordinary page/chunk embedding pauses. Per table, one transaction swaps `embedding_next` into the live column and sets `embedding_model`/`embedding_dim`; then the progress PUT carries `cutover_done: true` and the gateway makes the new model the space's model. |
+
+Where the re-embed text comes from, per table: `page_embeddings` (`pages.text`),
+`chunk_embeddings` (`page_chunks.text`), `noo_entries` (`content`, clipped to
+1500 characters as the entry worker does), `trellion_traversal_records`
+(`query_text`), `entity_embeddings` (the neighbourhood description trellion-intel
+embeds, rebuilt from `entities` and `edges`). Derived, not embedded:
+`entity_clusters` (a leaf centroid is the mean of its members' staged vectors, a
+parent's the member-weighted mean of its children's) and `trellion_episodes`
+(copied from the traversal record it was archived with; an episode with no such
+record cannot be re-embedded). **Unsourced rows.** `trellion_concepts.centroid` (nothing in trellion,
+trellion-intel or trellion-evolve writes it) and episodes with no traversal
+record have neither stored text nor a derivation, and a row the embedder rejects
+even when sent alone (retried one at a time, then logged `reembed.row_skipped`
+and skipped for this migration) cannot be re-embedded. None is invented. They
+are left out of `done`/`total` and reported per table as
+`"unsourced": N` (`{done, total, unsourced}`). At cutover their vector and
+`embedding_model` are set to NULL in the same transaction (a skipped
+`entity_embeddings` row is deleted, its column being NOT NULL), so they drop out
+of search instead of keeping an old-model vector under the new model. Whatever
+owns them regenerates them on its next run.
+
+**Stale sweep.** With no migration running, rows whose `embedding_model` is set
+but is not the space's current model, and that have a source, are re-embedded
+into the live column with the plain space model (episodes copy from their
+traversal record). Same cadence as the legacy claim: at start, on a state
+change, then every five minutes. This heals the brief cutover race and anything
+else written under an old model. Cluster centroids follow their members on the
+next clustering run.
+
+Any ordinary write of a vector clears that row's staged `embedding_next` (it
+was computed from content that has just changed). The staging columns are
+`vector(1024)`, the same width as the live ones: a model of another width needs
+the columns retyped, which is not built.
+
 ## Database
 
 | Variable | Default | Effect | Stack sets |

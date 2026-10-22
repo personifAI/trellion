@@ -10,6 +10,12 @@ on:
     branches: [ main, dev, staging ]
   pull_request:
     branches: [ main, dev, staging ]
+  # GitHub's merge queue on `dev`: the queue builds a merge group (the PR(s) on the
+  # branch tip, on a gh-readonly-queue/* branch) and waits for the required
+  # checks to pass on it before merging. Without this trigger the required
+  # checks never report on the group and the queue times out.
+  merge_group:
+    types: [checks_requested]
   # Lets a run that never started be re-triggered without a new commit.
   workflow_dispatch:
 
@@ -56,12 +62,12 @@ jobs:
 
     steps:
       # persist-credentials: false keeps the checkout token out of git config.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -104,11 +110,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # persist-credentials: false keeps the checkout token out of git config.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
@@ -162,10 +168,10 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       # persist-credentials: false keeps the checkout token out of git config.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       # trellion depends on trellion-protocols, pinned by commit. It is public,
@@ -219,10 +225,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # persist-credentials: false keeps the checkout token out of git config.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       # trellion depends on trellion-protocols, pinned by commit. It is public,

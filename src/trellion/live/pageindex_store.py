@@ -24,6 +24,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from trellion_protocols.schema import ROLES_WHERE
 
+from trellion import embedding_space
+
 if TYPE_CHECKING:
     from trellion.live.recall.walk_store import WalkStore
 
@@ -51,9 +53,20 @@ class EmbedClaim:
             return 0
         await self._check(items[0][1])
         await self._conn.execute(
-            text(self._sql), [{self._key: i, "vec": self._vec(e)} for i, e in items]
+            text(self._sql),
+            [{self._key: i, "vec": self._vec(e), **_provenance(e)} for i, e in items],
         )
         return len(items)
+
+
+def _provenance(vector: Any) -> dict:
+    """The ``:model`` / ``:dim`` bind values recorded beside a vector.
+
+    ``model`` is the model the embed RESPONSE named (carried on the vector by
+    :mod:`trellion.embedding_space`); a bare list records NULL and is labelled
+    by the worker's legacy claim. ``dim`` is the vector's own width.
+    """
+    return {"model": embedding_space.model_of(vector), "dim": len(vector) if vector else None}
 
 
 def _get_embedding_dim() -> int:
@@ -727,11 +740,16 @@ class PageIndexStore:
         async with self._engine.connect() as conn:
             await conn.execute(
                 text("""
-                INSERT INTO page_embeddings (page_id, embedding)
-                VALUES (:page_id, CAST(:vec AS vector))
-                ON CONFLICT (page_id) DO UPDATE SET embedding = EXCLUDED.embedding
+                INSERT INTO page_embeddings (page_id, embedding, embedding_model, embedding_dim)
+                VALUES (:page_id, CAST(:vec AS vector), :model, :dim)
+                ON CONFLICT (page_id) DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding_dim = EXCLUDED.embedding_dim,
+                    embedding_next = NULL,
+                    embedding_next_model = NULL
                 """),
-                {"page_id": page_id, "vec": vec},
+                {"page_id": page_id, "vec": vec, **_provenance(embedding)},
             )
             await conn.commit()
 
@@ -744,11 +762,16 @@ class PageIndexStore:
         async with self._engine.connect() as conn:
             await conn.execute(
                 text("""
-                INSERT INTO chunk_embeddings (chunk_id, embedding)
-                VALUES (:chunk_id, CAST(:vec AS vector))
-                ON CONFLICT (chunk_id) DO UPDATE SET embedding = EXCLUDED.embedding
+                INSERT INTO chunk_embeddings (chunk_id, embedding, embedding_model, embedding_dim)
+                VALUES (:chunk_id, CAST(:vec AS vector), :model, :dim)
+                ON CONFLICT (chunk_id) DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding_dim = EXCLUDED.embedding_dim,
+                    embedding_next = NULL,
+                    embedding_next_model = NULL
                 """),
-                {"chunk_id": chunk_id, "vec": vec},
+                {"chunk_id": chunk_id, "vec": vec, **_provenance(embedding)},
             )
             await conn.commit()
 
@@ -763,13 +786,18 @@ class PageIndexStore:
         # re-embed actually uses — guarding only the single-write methods
         # would leave bulk traffic, i.e. all of it, unchecked.
         await self._check_dims("page_embeddings", items[0][1])
-        rows = [{"page_id": pid, "vec": self._vec(emb)} for pid, emb in items]
+        rows = [{"page_id": pid, "vec": self._vec(emb), **_provenance(emb)} for pid, emb in items]
         async with self._engine.begin() as conn:
             await conn.execute(
                 text("""
-                INSERT INTO page_embeddings (page_id, embedding)
-                VALUES (:page_id, CAST(:vec AS vector))
-                ON CONFLICT (page_id) DO UPDATE SET embedding = EXCLUDED.embedding
+                INSERT INTO page_embeddings (page_id, embedding, embedding_model, embedding_dim)
+                VALUES (:page_id, CAST(:vec AS vector), :model, :dim)
+                ON CONFLICT (page_id) DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding_dim = EXCLUDED.embedding_dim,
+                    embedding_next = NULL,
+                    embedding_next_model = NULL
                 """),
                 rows,
             )
@@ -782,13 +810,18 @@ class PageIndexStore:
         if not items:
             return 0
         await self._check_dims("chunk_embeddings", items[0][1])
-        rows = [{"chunk_id": cid, "vec": self._vec(emb)} for cid, emb in items]
+        rows = [{"chunk_id": cid, "vec": self._vec(emb), **_provenance(emb)} for cid, emb in items]
         async with self._engine.begin() as conn:
             await conn.execute(
                 text("""
-                INSERT INTO chunk_embeddings (chunk_id, embedding)
-                VALUES (:chunk_id, CAST(:vec AS vector))
-                ON CONFLICT (chunk_id) DO UPDATE SET embedding = EXCLUDED.embedding
+                INSERT INTO chunk_embeddings (chunk_id, embedding, embedding_model, embedding_dim)
+                VALUES (:chunk_id, CAST(:vec AS vector), :model, :dim)
+                ON CONFLICT (chunk_id) DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding_dim = EXCLUDED.embedding_dim,
+                    embedding_next = NULL,
+                    embedding_next_model = NULL
                 """),
                 rows,
             )
@@ -838,6 +871,14 @@ class PageIndexStore:
         if roles is not None:
             where.append(self._ROLES_WHERE)
             params["roles"] = list(roles)
+        # Only vectors from the space's current model are comparable to the
+        # query vector (dropped, never emptied, when the model is unknown).
+        model_sql, model_params = await embedding_space.model_clause(
+            "pe.embedding_model", query_vector=embedding
+        )
+        if model_sql:
+            where.append(model_sql)
+            params.update(model_params)
         where_sql = "WHERE " + " AND ".join(where)
         async with self._engine.connect() as conn:
             result = await conn.execute(
@@ -895,6 +936,12 @@ class PageIndexStore:
         if roles is not None:
             where.append(self._ROLES_WHERE)
             params["roles"] = roles
+        model_sql, model_params = await embedding_space.model_clause(
+            "ce.embedding_model", query_vector=embedding
+        )
+        if model_sql:
+            where.append(model_sql)
+            params.update(model_params)
         where_sql = f"WHERE {' AND '.join(where)}"
         async with self._engine.connect() as conn:
             result = await conn.execute(
@@ -1018,9 +1065,14 @@ class PageIndexStore:
             """,
             limit,
             """
-            INSERT INTO page_embeddings (page_id, embedding)
-            VALUES (:page_id, CAST(:vec AS vector))
-            ON CONFLICT (page_id) DO UPDATE SET embedding = EXCLUDED.embedding
+            INSERT INTO page_embeddings (page_id, embedding, embedding_model, embedding_dim)
+            VALUES (:page_id, CAST(:vec AS vector), :model, :dim)
+            ON CONFLICT (page_id) DO UPDATE SET
+                embedding = EXCLUDED.embedding,
+                embedding_model = EXCLUDED.embedding_model,
+                embedding_dim = EXCLUDED.embedding_dim,
+                embedding_next = NULL,
+                embedding_next_model = NULL
             """,
             "page_embeddings",
             "page_id",
@@ -1043,9 +1095,14 @@ class PageIndexStore:
             """,
             limit,
             """
-            INSERT INTO chunk_embeddings (chunk_id, embedding)
-            VALUES (:chunk_id, CAST(:vec AS vector))
-            ON CONFLICT (chunk_id) DO UPDATE SET embedding = EXCLUDED.embedding
+            INSERT INTO chunk_embeddings (chunk_id, embedding, embedding_model, embedding_dim)
+            VALUES (:chunk_id, CAST(:vec AS vector), :model, :dim)
+            ON CONFLICT (chunk_id) DO UPDATE SET
+                embedding = EXCLUDED.embedding,
+                embedding_model = EXCLUDED.embedding_model,
+                embedding_dim = EXCLUDED.embedding_dim,
+                embedding_next = NULL,
+                embedding_next_model = NULL
             """,
             "chunk_embeddings",
             "chunk_id",
@@ -1646,19 +1703,32 @@ class PageIndexStore:
         embedding: list[float],
         generation: int,
     ) -> None:
-        """Insert or update a graph-aware entity embedding."""
+        """Insert or update a graph-aware entity embedding.
+
+        The signature is the ``GraphStore`` protocol's, so the model cannot be
+        a parameter: it is the model the embed response named, carried on
+        ``embedding`` (:mod:`trellion.embedding_space`).
+        """
         vec = self._vec(embedding)
+        prov = _provenance(embedding)
         async with self._engine.connect() as conn:
             await conn.execute(
                 text("""
-                INSERT INTO entity_embeddings (entity_id, embedding, computed_at, generation)
-                VALUES (:entity_id, CAST(:vec AS vector), NOW(), :generation)
+                INSERT INTO entity_embeddings
+                    (entity_id, embedding, computed_at, generation,
+                     embedding_model, embedding_dim)
+                VALUES (:entity_id, CAST(:vec AS vector), NOW(), :generation,
+                        :model, :dim)
                 ON CONFLICT (entity_id) DO UPDATE
                     SET embedding = EXCLUDED.embedding,
                         computed_at = EXCLUDED.computed_at,
-                        generation = EXCLUDED.generation
+                        generation = EXCLUDED.generation,
+                        embedding_model = EXCLUDED.embedding_model,
+                        embedding_dim = EXCLUDED.embedding_dim,
+                        embedding_next = NULL,
+                        embedding_next_model = NULL
                 """),
-                {"entity_id": entity_id, "vec": vec, "generation": generation},
+                {"entity_id": entity_id, "vec": vec, "generation": generation, **prov},
             )
             await conn.commit()
 
@@ -1672,19 +1742,24 @@ class PageIndexStore:
         Returns entity_ids and cosine similarity scores, ordered by relevance.
         """
         vec = self._vec(embedding)
+        model_sql, model_params = await embedding_space.model_clause(
+            "ee.embedding_model", query_vector=embedding
+        )
+        where_sql = f"WHERE {model_sql}" if model_sql else ""
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                text("""
+                text(f"""
                 SELECT ee.entity_id,
                        1 - (ee.embedding <=> CAST(:vec AS vector)) AS score,
                        e.canonical_name,
                        e.type
                 FROM entity_embeddings ee
                 JOIN entities e ON e.entity_id = ee.entity_id
+                {where_sql}
                 ORDER BY ee.embedding <=> CAST(:vec2 AS vector)
                 LIMIT :top_k
                 """),
-                {"vec": vec, "vec2": vec, "top_k": top_k},
+                {"vec": vec, "vec2": vec, "top_k": top_k, **model_params},
             )
             rows = result.fetchall()
             return [
@@ -1747,17 +1822,30 @@ class PageIndexStore:
         member_count: int,
         generation: int,
     ) -> None:
-        """Insert or update a hierarchical entity cluster."""
+        """Insert or update a hierarchical entity cluster.
+
+        A centroid is computed from entity vectors, so it has no embed
+        response of its own. A caller that knows the model of the vectors it
+        averaged passes the centroid as an
+        :class:`~trellion.embedding_space.Vector` carrying it; a bare list is
+        recorded under the space's current model (the entity vectors it
+        averaged are in that space).
+        """
         centroid_val = self._vec(centroid) if centroid else None
+        centroid_model: Optional[str] = None
+        if centroid:
+            centroid_model = await embedding_space.write_model(centroid)
         async with self._engine.connect() as conn:
             await conn.execute(
                 text("""
                 INSERT INTO entity_clusters
                     (cluster_id, name, level, parent_cluster_id, summary,
-                     centroid, member_count, computed_at, generation)
+                     centroid, member_count, computed_at, generation,
+                     embedding_model, embedding_dim)
                 VALUES
                     (:cluster_id, :name, :level, :parent_id, :summary,
-                     CAST(:centroid AS vector), :member_count, NOW(), :generation)
+                     CAST(:centroid AS vector), :member_count, NOW(), :generation,
+                     :model, :dim)
                 ON CONFLICT (cluster_id) DO UPDATE
                     SET name = EXCLUDED.name,
                         level = EXCLUDED.level,
@@ -1766,7 +1854,11 @@ class PageIndexStore:
                         centroid = EXCLUDED.centroid,
                         member_count = EXCLUDED.member_count,
                         computed_at = EXCLUDED.computed_at,
-                        generation = EXCLUDED.generation
+                        generation = EXCLUDED.generation,
+                        embedding_model = EXCLUDED.embedding_model,
+                        embedding_dim = EXCLUDED.embedding_dim,
+                        embedding_next = NULL,
+                        embedding_next_model = NULL
                 """),
                 {
                     "cluster_id": cluster_id,
@@ -1777,6 +1869,8 @@ class PageIndexStore:
                     "centroid": centroid_val,
                     "member_count": member_count,
                     "generation": generation,
+                    "model": centroid_model,
+                    "dim": len(centroid) if centroid else None,
                 },
             )
             await conn.commit()
@@ -1849,18 +1943,23 @@ class PageIndexStore:
     ) -> list[dict]:
         """Vector similarity search over cluster centroids."""
         vec = self._vec(embedding)
+        model_sql, model_params = await embedding_space.model_clause(
+            "c.embedding_model", query_vector=embedding
+        )
+        model_and = f"AND {model_sql}" if model_sql else ""
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                text("""
+                text(f"""
                 SELECT c.cluster_id, c.name, c.level, c.parent_cluster_id,
                        c.summary, c.member_count, c.generation,
                        1 - (c.centroid <=> CAST(:vec AS vector)) AS score
                 FROM entity_clusters c
                 WHERE c.centroid IS NOT NULL
+                {model_and}
                 ORDER BY c.centroid <=> CAST(:vec2 AS vector)
                 LIMIT :top_k
                 """),
-                {"vec": vec, "vec2": vec, "top_k": top_k},
+                {"vec": vec, "vec2": vec, "top_k": top_k, **model_params},
             )
             rows = result.fetchall()
             return [

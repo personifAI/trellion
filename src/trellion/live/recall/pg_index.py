@@ -22,6 +22,8 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from trellion import embedding_space
+
 from .faiss_index import PROMINENCE_WEIGHT, SIMILARITY_WEIGHT, SearchResult
 
 logger = structlog.get_logger(__name__)
@@ -46,24 +48,32 @@ class PersonaVectorIndex:
         prominence: float = 0.5,
         record_type: str = "conversation",
         content_summary: str = "",
+        embedding_model: str | None = None,
     ) -> None:
         """Attach an embedding to a frame, creating the row if needed.
 
         The traversal archiver writes its frame row (with embedding)
         directly; this upsert exists for writers that only have a vector
         — it keeps the old ``PersonaFAISSIndex.add`` contract of "one
-        call registers a searchable frame".
+        call registers a searchable frame". The model recorded is
+        ``embedding_model``, else the one the vector carries, else the
+        space's current model.
         """
+        model = embedding_model or await embedding_space.write_model(embedding)
         async with self._engine.begin() as conn:
             await conn.execute(
                 text(
                     "INSERT INTO trellion_episodes "
                     "(id, persona_id, record_type, index_name, "
-                    " content_summary, prominence_score, embedding) "
+                    " content_summary, prominence_score, embedding, "
+                    " embedding_model, embedding_dim) "
                     "VALUES (CAST(:id AS uuid), :persona, :rtype, :iname, "
-                    "        :summary, :prom, CAST(:emb AS vector)) "
+                    "        :summary, :prom, CAST(:emb AS vector), :model, :dim) "
                     "ON CONFLICT (id) DO UPDATE SET "
                     "  embedding = EXCLUDED.embedding, "
+                    "  embedding_model = EXCLUDED.embedding_model, "
+                    "  embedding_dim = EXCLUDED.embedding_dim, "
+                    "  embedding_next = NULL, embedding_next_model = NULL, "
                     "  prominence_score = EXCLUDED.prominence_score, "
                     "  updated_at = NOW()"
                 ),
@@ -75,6 +85,8 @@ class PersonaVectorIndex:
                     "summary": content_summary or f"{record_type} frame",
                     "prom": prominence,
                     "emb": _vec_literal(embedding),
+                    "model": model,
+                    "dim": len(embedding),
                 },
             )
 
@@ -104,6 +116,11 @@ class PersonaVectorIndex:
         }
         if index_name:
             params["iname"] = index_name
+        model_sql, model_params = await embedding_space.model_clause(
+            "embedding_model", query_vector=query_embedding
+        )
+        model_where = f"  AND {model_sql} " if model_sql else ""
+        params.update(model_params)
         async with self._engine.connect() as conn:
             rows = (
                 await conn.execute(
@@ -116,6 +133,7 @@ class PersonaVectorIndex:
                         f"  {iname_where}"
                         "  AND is_tombstoned = FALSE "
                         "  AND embedding IS NOT NULL "
+                        f"{model_where}"
                         "ORDER BY (:simw * (1 - (embedding <=> CAST(:vec2 AS vector))) "
                         "          + :promw * prominence_score) DESC "
                         "LIMIT :k"
@@ -159,7 +177,9 @@ async def backfill_frame_embeddings(engine: AsyncEngine) -> dict:
             await conn.execute(
                 text(
                     "UPDATE trellion_episodes f "
-                    "SET embedding = tr.query_embedding, updated_at = NOW() "
+                    "SET embedding = tr.query_embedding, "
+                    "    embedding_model = tr.embedding_model, "
+                    "    embedding_dim = tr.embedding_dim, updated_at = NOW() "
                     "FROM trellion_traversal_records tr "
                     "WHERE tr.video_frame_id = f.id "
                     "  AND tr.query_embedding IS NOT NULL "
