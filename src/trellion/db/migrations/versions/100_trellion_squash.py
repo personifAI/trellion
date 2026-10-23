@@ -44,6 +44,12 @@ at cutover. The adopt path below stamps this revision without touching it.
 CREATES IF ABSENT, ADOPTS IF PRESENT — the contract of every
 system baseline, and what makes the deployment order forgiving: a container running this
 against an already-migrated database stamps and stops.
+
+THE CONVERSATION TABLES ARE SHARED. `noo_conversations` and its four
+children are the host's chat record as much as trellion's memory, and a host
+(noomesh) may build them before trellion ever runs. They are a separate blob,
+created only when no schema has them yet; trellion still builds them itself
+when it runs standalone.
 """
 from __future__ import annotations
 
@@ -58,27 +64,23 @@ down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# One table is enough to detect a legacy install: `noo_conversations` has
-# existed since revision 001 of the old chain.
-_SENTINEL = "noo_conversations"
+# One table is enough to detect a legacy install (the old chain built all 27).
+# It must be one only trellion creates. `noo_conversations` used to be the
+# sentinel, but the conversation tables may now come from the host (below),
+# and a host-built `noo_conversations` made this revision stamp an install
+# that had none of trellion's own tables.
+_SENTINEL = "trellion_snapshots"
+
+# The conversation tables trellion shares with its host. Noomesh can own
+# them (it records chats without trellion); standalone trellion still needs
+# them. Created here only when no schema has `noo_conversations` yet — a
+# second copy in `trellion` would shadow the host's for one side and split
+# every conversation in two, silently. Looked up in EVERY schema, not just
+# this search_path, for the same reason: a missing relation fails loudly,
+# a duplicate one does not.
+_CONVERSATION_SENTINEL = "noo_conversations"
 
 _DDL = """\
-CREATE FUNCTION noo_conv_set_org() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    IF NEW.org_id IS NULL AND NEW.user_id IS NOT NULL THEN
-        IF NEW.user_id LIKE 'team:%' THEN
-            NEW.org_id := (SELECT org_id FROM noo_kb_teams
-                           WHERE 'team:' || name = NEW.user_id);
-        ELSE
-            NEW.org_id := (SELECT org_id FROM noo_users
-                           WHERE username = NEW.user_id);
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$$;
 CREATE TABLE chunk_embeddings (
     chunk_id uuid NOT NULL,
     embedding vector(1024),
@@ -183,34 +185,6 @@ CREATE TABLE pages (
     meta_json jsonb,
     last_accessed_at timestamp with time zone
 );
-CREATE TABLE noo_context_retrievals (
-    id uuid NOT NULL,
-    conversation_id uuid NOT NULL,
-    entry_id uuid,
-    query text NOT NULL,
-    scope text NOT NULL,
-    results jsonb NOT NULL,
-    top_score double precision,
-    retrieval_ms integer,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-CREATE TABLE noo_conversations (
-    id uuid NOT NULL,
-    user_id text,
-    session_id text,
-    persona_id text,
-    backend text,
-    model text,
-    started_at timestamp with time zone DEFAULT now() NOT NULL,
-    ended_at timestamp with time zone,
-    total_messages integer DEFAULT 0,
-    total_tool_calls integer DEFAULT 0,
-    total_tokens_in integer DEFAULT 0,
-    total_tokens_out integer DEFAULT 0,
-    total_latency_ms integer DEFAULT 0,
-    metadata jsonb DEFAULT '{}'::jsonb,
-    org_id text
-);
 CREATE TABLE noo_entities_typed (
     id uuid NOT NULL,
     type text NOT NULL,
@@ -219,27 +193,6 @@ CREATE TABLE noo_entities_typed (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     user_id text,
     org_id text
-);
-CREATE TABLE noo_entries (
-    id uuid NOT NULL,
-    conversation_id uuid NOT NULL,
-    parent_id uuid,
-    type text NOT NULL,
-    content text NOT NULL,
-    metadata jsonb DEFAULT '{}'::jsonb,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    embedding vector(1024),
-    indexed_at timestamp with time zone,
-    embedding_model text,
-    embedding_dim integer
-);
-CREATE TABLE noo_feedback (
-    id uuid NOT NULL,
-    conversation_id uuid,
-    entry_id uuid,
-    feedback_type text NOT NULL,
-    value jsonb,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 CREATE TABLE noo_semantic_relationships (
     id integer NOT NULL,
@@ -273,18 +226,6 @@ CREATE TABLE noo_temporal_edges (
     metadata jsonb DEFAULT '{}'::jsonb,
     user_id text,
     org_id text
-);
-CREATE TABLE noo_tool_executions (
-    id uuid NOT NULL,
-    conversation_id uuid NOT NULL,
-    entry_id uuid,
-    tool_name text NOT NULL,
-    arguments jsonb NOT NULL,
-    success boolean,
-    output text,
-    error text,
-    execution_ms integer,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 CREATE TABLE trellion_communities (
     id uuid NOT NULL,
@@ -396,22 +337,12 @@ ALTER TABLE ONLY page_embeddings
     ADD CONSTRAINT page_embeddings_pkey PRIMARY KEY (page_id);
 ALTER TABLE ONLY pages
     ADD CONSTRAINT pages_pkey PRIMARY KEY (page_id);
-ALTER TABLE ONLY noo_context_retrievals
-    ADD CONSTRAINT noo_context_retrievals_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY noo_conversations
-    ADD CONSTRAINT noo_conversations_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY noo_entities_typed
     ADD CONSTRAINT noo_entities_typed_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY noo_entries
-    ADD CONSTRAINT noo_entries_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY noo_feedback
-    ADD CONSTRAINT noo_feedback_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY noo_semantic_relationships
     ADD CONSTRAINT noo_semantic_relationships_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY noo_temporal_edges
     ADD CONSTRAINT noo_temporal_edges_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY noo_tool_executions
-    ADD CONSTRAINT noo_tool_executions_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY trellion_communities
     ADD CONSTRAINT trellion_communities_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY trellion_concepts
@@ -458,7 +389,6 @@ CREATE INDEX idx_trellion_traversal_persona ON trellion_traversal_records USING 
 CREATE INDEX idx_trellion_video_frames_lifecycle ON trellion_video_frames USING btree (prominence_score, created_at) WHERE (is_tombstoned = false);
 CREATE INDEX idx_trellion_video_frames_persona ON trellion_video_frames USING btree (persona_id, is_tombstoned);
 CREATE INDEX ix_chunk_embeddings_embedding_model ON chunk_embeddings USING btree (embedding_model) WHERE (embedding_model IS NOT NULL);
-CREATE INDEX ix_conversations_org ON noo_conversations USING btree (org_id) WHERE (org_id IS NOT NULL);
 CREATE INDEX ix_docs_metadata_gin ON docs USING gin (metadata);
 CREATE INDEX ix_docs_source_uri ON docs USING btree (source_uri) WHERE ((source_uri IS NOT NULL) AND (source_uri <> ''::text));
 CREATE INDEX ix_edges_org ON edges USING btree (org_id) WHERE (org_id IS NOT NULL);
@@ -471,8 +401,6 @@ CREATE INDEX ix_entity_clusters_embedding_model ON entity_clusters USING btree (
 CREATE INDEX ix_entity_embeddings_embedding_model ON entity_embeddings USING btree (embedding_model) WHERE (embedding_model IS NOT NULL);
 CREATE INDEX ix_page_embeddings_embedding_model ON page_embeddings USING btree (embedding_model) WHERE (embedding_model IS NOT NULL);
 CREATE INDEX ix_pages_last_accessed ON pages USING btree (last_accessed_at) WHERE (last_accessed_at IS NOT NULL);
-CREATE INDEX ix_noo_conversations_persona_id ON noo_conversations USING btree (persona_id);
-CREATE INDEX ix_noo_entries_embedding_model ON noo_entries USING btree (embedding_model) WHERE (embedding_model IS NOT NULL);
 CREATE INDEX ix_temporal_edges_org ON noo_temporal_edges USING btree (org_id) WHERE (org_id IS NOT NULL);
 CREATE INDEX ix_temporal_edges_user_id ON noo_temporal_edges USING btree (user_id) WHERE (user_id IS NOT NULL);
 CREATE INDEX ix_trellion_concepts_embedding_model ON trellion_concepts USING btree (embedding_model) WHERE (embedding_model IS NOT NULL);
@@ -484,21 +412,11 @@ CREATE INDEX mentions_page_idx ON mentions USING btree (page_id);
 CREATE INDEX page_chunks_page_idx ON page_chunks USING btree (page_id);
 CREATE INDEX page_embeddings_hnsw_idx ON page_embeddings USING hnsw (embedding vector_cosine_ops);
 CREATE UNIQUE INDEX pages_doc_page_idx ON pages USING btree (doc_id, page_no);
-CREATE INDEX noo_conv_persona_idx ON noo_conversations USING btree (persona_id, started_at DESC);
-CREATE INDEX noo_conv_user_idx ON noo_conversations USING btree (user_id, started_at DESC);
-CREATE INDEX noo_entries_content_trgm_idx ON noo_entries USING gin (content gin_trgm_ops);
-CREATE INDEX noo_entries_conv_idx ON noo_entries USING btree (conversation_id, created_at);
-CREATE INDEX noo_entries_embedding_idx ON noo_entries USING hnsw (embedding vector_cosine_ops) WHERE (embedding IS NOT NULL);
-CREATE INDEX noo_entries_type_idx ON noo_entries USING btree (type);
-CREATE INDEX noo_entries_unembedded_idx ON noo_entries USING btree (created_at) WHERE (embedding IS NULL);
 CREATE INDEX noo_sem_rel_source_idx ON noo_semantic_relationships USING btree (source_id);
 CREATE INDEX noo_sem_rel_target_idx ON noo_semantic_relationships USING btree (target_id);
 CREATE UNIQUE INDEX noo_sem_rel_unique ON noo_semantic_relationships USING btree (source_id, target_id, relationship_type);
-CREATE INDEX noo_tool_exec_conv_idx ON noo_tool_executions USING btree (conversation_id);
-CREATE INDEX noo_tool_exec_name_idx ON noo_tool_executions USING btree (tool_name, success);
 CREATE UNIQUE INDEX uq_entities_typed_type_name ON noo_entities_typed USING btree (type, canonical_name);
 CREATE UNIQUE INDEX uq_trellion_concepts_snapshot_name_type ON trellion_concepts USING btree (snapshot_id, canonical_name, type);
-CREATE TRIGGER noo_conv_set_org_trg BEFORE INSERT ON noo_conversations FOR EACH ROW EXECUTE FUNCTION noo_conv_set_org();
 ALTER TABLE ONLY chunk_embeddings
     ADD CONSTRAINT chunk_embeddings_chunk_id_fkey FOREIGN KEY (chunk_id) REFERENCES page_chunks(chunk_id) ON DELETE CASCADE;
 ALTER TABLE ONLY edges
@@ -525,24 +443,10 @@ ALTER TABLE ONLY page_embeddings
     ADD CONSTRAINT page_embeddings_page_id_fkey FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE;
 ALTER TABLE ONLY pages
     ADD CONSTRAINT pages_doc_id_fkey FOREIGN KEY (doc_id) REFERENCES docs(doc_id) ON DELETE CASCADE;
-ALTER TABLE ONLY noo_context_retrievals
-    ADD CONSTRAINT noo_context_retrievals_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES noo_conversations(id);
-ALTER TABLE ONLY noo_context_retrievals
-    ADD CONSTRAINT noo_context_retrievals_entry_id_fkey FOREIGN KEY (entry_id) REFERENCES noo_entries(id);
-ALTER TABLE ONLY noo_entries
-    ADD CONSTRAINT noo_entries_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES noo_conversations(id);
-ALTER TABLE ONLY noo_feedback
-    ADD CONSTRAINT noo_feedback_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES noo_conversations(id);
-ALTER TABLE ONLY noo_feedback
-    ADD CONSTRAINT noo_feedback_entry_id_fkey FOREIGN KEY (entry_id) REFERENCES noo_entries(id);
 ALTER TABLE ONLY noo_temporal_edges
     ADD CONSTRAINT noo_temporal_edges_object_entity_id_fkey FOREIGN KEY (object_entity_id) REFERENCES noo_entities_typed(id) ON DELETE SET NULL;
 ALTER TABLE ONLY noo_temporal_edges
     ADD CONSTRAINT noo_temporal_edges_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES noo_entities_typed(id) ON DELETE CASCADE;
-ALTER TABLE ONLY noo_tool_executions
-    ADD CONSTRAINT noo_tool_executions_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES noo_conversations(id);
-ALTER TABLE ONLY noo_tool_executions
-    ADD CONSTRAINT noo_tool_executions_entry_id_fkey FOREIGN KEY (entry_id) REFERENCES noo_entries(id);
 ALTER TABLE ONLY trellion_communities
     ADD CONSTRAINT trellion_communities_parent_community_id_fkey FOREIGN KEY (parent_community_id) REFERENCES trellion_communities(id);
 ALTER TABLE ONLY trellion_communities
@@ -563,22 +467,144 @@ ALTER TABLE ONLY trellion_traversal_records
     ADD CONSTRAINT trellion_traversal_records_video_frame_id_fkey FOREIGN KEY (video_frame_id) REFERENCES trellion_video_frames(id) ON DELETE SET NULL;
 """
 
+# The conversation group: `noo_conversations` and its four children, the
+# `noo_conv_set_org` trigger and function. Nothing in `_DDL` references it.
+_CONVERSATION_DDL = """\
+CREATE FUNCTION noo_conv_set_org() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.org_id IS NULL AND NEW.user_id IS NOT NULL THEN
+        IF NEW.user_id LIKE 'team:%' THEN
+            NEW.org_id := (SELECT org_id FROM noo_kb_teams
+                           WHERE 'team:' || name = NEW.user_id);
+        ELSE
+            NEW.org_id := (SELECT org_id FROM noo_users
+                           WHERE username = NEW.user_id);
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TABLE noo_context_retrievals (
+    id uuid NOT NULL,
+    conversation_id uuid NOT NULL,
+    entry_id uuid,
+    query text NOT NULL,
+    scope text NOT NULL,
+    results jsonb NOT NULL,
+    top_score double precision,
+    retrieval_ms integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE TABLE noo_conversations (
+    id uuid NOT NULL,
+    user_id text,
+    session_id text,
+    persona_id text,
+    backend text,
+    model text,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    ended_at timestamp with time zone,
+    total_messages integer DEFAULT 0,
+    total_tool_calls integer DEFAULT 0,
+    total_tokens_in integer DEFAULT 0,
+    total_tokens_out integer DEFAULT 0,
+    total_latency_ms integer DEFAULT 0,
+    metadata jsonb DEFAULT '{}'::jsonb,
+    org_id text
+);
+CREATE TABLE noo_entries (
+    id uuid NOT NULL,
+    conversation_id uuid NOT NULL,
+    parent_id uuid,
+    type text NOT NULL,
+    content text NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    embedding vector(1024),
+    indexed_at timestamp with time zone,
+    embedding_model text,
+    embedding_dim integer
+);
+CREATE TABLE noo_feedback (
+    id uuid NOT NULL,
+    conversation_id uuid,
+    entry_id uuid,
+    feedback_type text NOT NULL,
+    value jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE TABLE noo_tool_executions (
+    id uuid NOT NULL,
+    conversation_id uuid NOT NULL,
+    entry_id uuid,
+    tool_name text NOT NULL,
+    arguments jsonb NOT NULL,
+    success boolean,
+    output text,
+    error text,
+    execution_ms integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+ALTER TABLE ONLY noo_context_retrievals
+    ADD CONSTRAINT noo_context_retrievals_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY noo_conversations
+    ADD CONSTRAINT noo_conversations_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY noo_entries
+    ADD CONSTRAINT noo_entries_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY noo_feedback
+    ADD CONSTRAINT noo_feedback_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY noo_tool_executions
+    ADD CONSTRAINT noo_tool_executions_pkey PRIMARY KEY (id);
+CREATE INDEX ix_conversations_org ON noo_conversations USING btree (org_id) WHERE (org_id IS NOT NULL);
+CREATE INDEX ix_noo_conversations_persona_id ON noo_conversations USING btree (persona_id);
+CREATE INDEX ix_noo_entries_embedding_model ON noo_entries USING btree (embedding_model) WHERE (embedding_model IS NOT NULL);
+CREATE INDEX noo_conv_persona_idx ON noo_conversations USING btree (persona_id, started_at DESC);
+CREATE INDEX noo_conv_user_idx ON noo_conversations USING btree (user_id, started_at DESC);
+CREATE INDEX noo_entries_content_trgm_idx ON noo_entries USING gin (content gin_trgm_ops);
+CREATE INDEX noo_entries_conv_idx ON noo_entries USING btree (conversation_id, created_at);
+CREATE INDEX noo_entries_embedding_idx ON noo_entries USING hnsw (embedding vector_cosine_ops) WHERE (embedding IS NOT NULL);
+CREATE INDEX noo_entries_type_idx ON noo_entries USING btree (type);
+CREATE INDEX noo_entries_unembedded_idx ON noo_entries USING btree (created_at) WHERE (embedding IS NULL);
+CREATE INDEX noo_tool_exec_conv_idx ON noo_tool_executions USING btree (conversation_id);
+CREATE INDEX noo_tool_exec_name_idx ON noo_tool_executions USING btree (tool_name, success);
+CREATE TRIGGER noo_conv_set_org_trg BEFORE INSERT ON noo_conversations FOR EACH ROW EXECUTE FUNCTION noo_conv_set_org();
+ALTER TABLE ONLY noo_context_retrievals
+    ADD CONSTRAINT noo_context_retrievals_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES noo_conversations(id);
+ALTER TABLE ONLY noo_context_retrievals
+    ADD CONSTRAINT noo_context_retrievals_entry_id_fkey FOREIGN KEY (entry_id) REFERENCES noo_entries(id);
+ALTER TABLE ONLY noo_entries
+    ADD CONSTRAINT noo_entries_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES noo_conversations(id);
+ALTER TABLE ONLY noo_feedback
+    ADD CONSTRAINT noo_feedback_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES noo_conversations(id);
+ALTER TABLE ONLY noo_feedback
+    ADD CONSTRAINT noo_feedback_entry_id_fkey FOREIGN KEY (entry_id) REFERENCES noo_entries(id);
+ALTER TABLE ONLY noo_tool_executions
+    ADD CONSTRAINT noo_tool_executions_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES noo_conversations(id);
+ALTER TABLE ONLY noo_tool_executions
+    ADD CONSTRAINT noo_tool_executions_entry_id_fkey FOREIGN KEY (entry_id) REFERENCES noo_entries(id);
+"""
 
-def upgrade() -> None:
-    bind = op.get_bind()
-    present = bind.execute(
+
+def _exists_anywhere(bind, table: str) -> bool:
+    return bool(bind.execute(
         sa.text(
             "SELECT 1 FROM information_schema.tables WHERE table_name = :t"
         ),
-        {"t": _SENTINEL},
-    ).scalar()
-    if present:
+        {"t": table},
+    ).scalar())
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    if _exists_anywhere(bind, _SENTINEL):
         # Legacy install: everything already exists (in public), built by the
         # old 001–012 chain. Stamp and stop — the tables move at the cutover,
         # not here, because a migration that also relocates data is a failure
         # nobody can attribute.
         return
-    # ONE execute for the whole blob, through the RAW DRIVER connection.
+    # ONE execute per blob, through the RAW DRIVER connection.
     # Two failed cuts bought this shape:
     #   - splitting on ";\n" shattered the `noo_conv_set_org` function, whose
     #     plpgsql body legitimately contains semicolon-newlines of its own —
@@ -589,7 +615,10 @@ def upgrade() -> None:
     # psycopg's own execute() with params=None sends the text as-is: no
     # splitting, no placeholder scan. Same alembic transaction — it is the
     # same underlying connection.
-    op.get_bind().connection.driver_connection.execute(_DDL)
+    raw = bind.connection.driver_connection
+    raw.execute(_DDL)
+    if not _exists_anywhere(bind, _CONVERSATION_SENTINEL):
+        raw.execute(_CONVERSATION_DDL)
 
 
 def downgrade() -> None:
