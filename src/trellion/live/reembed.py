@@ -24,6 +24,14 @@ every host already starts, so there is no second thing to deploy. One
    column into the live one; then the progress PUT carries
    ``cutover_done: true`` and the gateway flips the space's model.
 
+No transaction is held while a batch embeds (with ``NOO_EMBED_BULK`` that wait
+is minutes). Every embedding loop here is CLAIM (short transaction: pick rows,
+read each one's id and an md5 of its source, commit), EMBED (nothing open),
+WRITE BACK (short transaction: update a row only if its source still hashes to
+what was read and it still needs this work). A row that changed meanwhile is
+skipped and picked up again by the normal selection; a row two workers picked
+is written once, the second write being a no-op. See :meth:`ReembedWorker._fill_text`.
+
 The live column keeps serving throughout: nothing here touches ``embedding``
 until the swap, and every ordinary vector write clears the row's staged
 vector (it was computed from content that just changed).
@@ -395,7 +403,8 @@ class ReembedWorker:
         """The claim for a ``text`` table. ``:next`` and ``:limit`` bind."""
         after = f" AND t.{spec.pk} > CAST(:after AS uuid)" if cursor else ""
         return (
-            f"SELECT t.{spec.pk} AS pk, {spec.src} AS src FROM {spec.source_from} "
+            f"SELECT t.{spec.pk} AS pk, {spec.src} AS src, md5({spec.src}) AS seen "
+            f"FROM {spec.source_from} "
             f"WHERE t.{spec.vec} IS NOT NULL "
             f"AND t.embedding_next_model IS DISTINCT FROM :next{after} "
             f"ORDER BY t.{spec.pk} LIMIT :limit FOR NO KEY UPDATE OF t SKIP LOCKED"
@@ -403,10 +412,44 @@ class ReembedWorker:
 
     @staticmethod
     def store_next_sql(spec: TableSpec) -> str:
+        """Write a staged vector. ``text`` and ``entity`` rows are guarded.
+
+        The guard is the write-back recheck: the row must still have a vector
+        and not yet be staged for ``:next`` (so a second worker's write is a
+        no-op), and a ``text`` row's source must still hash to ``:seen``. An
+        ``entity`` row's source is rechecked by the caller (it compares the
+        description it embedded to the current one). Cluster centroids are
+        derived in the same transaction as their write; unguarded.
+        """
+        if spec.kind == "text":
+            return (
+                f"UPDATE {spec.name} u SET embedding_next = CAST(:vec AS vector), "
+                f"embedding_next_model = :model FROM ("
+                f"SELECT t.{spec.pk} AS pk FROM {spec.source_from} "
+                f"WHERE t.{spec.pk} = CAST(:pk AS uuid) AND t.{spec.vec} IS NOT NULL "
+                f"AND t.embedding_next_model IS DISTINCT FROM :next "
+                f"AND md5({spec.src}) IS NOT DISTINCT FROM :seen) c "
+                f"WHERE u.{spec.pk} = c.pk"
+            )
+        if spec.kind == "entity":
+            return (
+                f"UPDATE {spec.name} SET embedding_next = CAST(:vec AS vector), "
+                f"embedding_next_model = :model WHERE {spec.pk} = CAST(:pk AS uuid) "
+                f"AND {spec.vec} IS NOT NULL AND embedding_next_model IS DISTINCT FROM :next"
+            )
         return (
             f"UPDATE {spec.name} SET embedding_next = CAST(:vec AS vector), "
             f"embedding_next_model = :model WHERE {spec.pk} = CAST(:pk AS uuid)"
         )
+
+    async def _write_back(self, sql: str, items: list[dict]) -> int:
+        """Run guarded updates in one short transaction; return rows written."""
+        written = 0
+        async with self._engine.begin() as conn:
+            for it in items:
+                res = await conn.execute(text(sql), it)
+                written += 1 if (res.rowcount or 0) > 0 else 0
+        return written
 
     def _is_skipped(self, spec: TableSpec, pk: str, key: str) -> bool:
         return (spec.name, pk, key) in self._skipped
@@ -495,6 +538,7 @@ class ReembedWorker:
         params: dict[str, Any] = {"next": nxt, "limit": self._batch}
         if after:
             params["after"] = after
+        # CLAIM: a short transaction, committed before anything is embedded.
         async with self._engine.connect() as conn:
             async with conn.begin():
                 rows = (
@@ -502,25 +546,36 @@ class ReembedWorker:
                         text(self.claim_sql(spec, cursor=bool(after))), params
                     )
                 ).fetchall()
-                if not rows:
-                    return 0
-                live = [r for r in rows if not self._is_skipped(spec, str(r[0]), nxt)]
-                if live:
-                    pks = [str(r[0]) for r in live]
-                    texts = [
-                        (r[1][:ENTRY_CLIP_CHARS] if spec.name == "noo_entries" else r[1]) or ""
-                        for r in live
-                    ]
-                    vecs, served = await self._embed_rows(spec, pks, texts, self._embed_next, nxt)
-                    good = [(pk, v) for pk, v in zip(pks, vecs) if v is not None]
-                    if good:
-                        model = self._check_vectors([v for _, v in good], served, rec, len(good))
-                        await conn.execute(
-                            text(self.store_next_sql(spec)),
-                            [{"vec": _lit(v), "model": model, "pk": pk} for pk, v in good],
-                        )
+        if not rows:
+            return 0
+        # EMBED: no transaction and no connection held.
+        live = [r for r in rows if not self._is_skipped(spec, str(r[0]), nxt)]
+        if live:
+            pks = [str(r[0]) for r in live]
+            texts = [
+                (r[1][:ENTRY_CLIP_CHARS] if spec.name == "noo_entries" else r[1]) or ""
+                for r in live
+            ]
+            vecs, served = await self._embed_rows(spec, pks, texts, self._embed_next, nxt)
+            good = [(r, v) for r, v in zip(live, vecs) if v is not None]
+            if good:
+                model = self._check_vectors([v for _, v in good], served, rec, len(good))
+                # WRITE BACK: only rows whose source is still what was read.
+                written = await self._write_back(
+                    self.store_next_sql(spec),
+                    [{"vec": _lit(v), "model": model, "pk": str(r[0]), "seen": r[2],
+                      "next": nxt} for r, v in good],
+                )
+                self._log_writeback(spec, len(good), written)
         self._cursor[spec.name] = str(rows[-1][0])
         return len(rows)
+
+    @staticmethod
+    def _log_writeback(spec: TableSpec, attempted: int, written: int) -> None:
+        if written < attempted:
+            log.info("reembed.writeback_skipped", table=spec.name,
+                     skipped=attempted - written,
+                     note="source changed or already staged; the next scan retries")
 
     # -- entity embeddings -------------------------------------------------
 
@@ -578,22 +633,46 @@ class ReembedWorker:
                 if not ids:
                     return 0
                 desc = await self._describe(conn, ids)
-                present = [
-                    i for i in ids if i in desc and not self._is_skipped(spec, i, nxt)
-                ]
-                if present:
-                    vecs, served = await self._embed_rows(
-                        spec, present, [desc[i] for i in present], self._embed_next, nxt
-                    )
-                    good = [(i, v) for i, v in zip(present, vecs) if v is not None]
-                    if good:
-                        model = self._check_vectors([v for _, v in good], served, rec, len(good))
-                        await conn.execute(
-                            text(self.store_next_sql(spec)),
-                            [{"vec": _lit(v), "model": model, "pk": i} for i, v in good],
-                        )
+        present = [i for i in ids if i in desc and not self._is_skipped(spec, i, nxt)]
+        if present:
+            vecs, served = await self._embed_rows(
+                spec, present, [desc[i] for i in present], self._embed_next, nxt
+            )
+            good = [(i, v) for i, v in zip(present, vecs) if v is not None]
+            if good:
+                model = self._check_vectors([v for _, v in good], served, rec, len(good))
+                written = await self._write_entities(
+                    spec, good, {i: desc[i] for i, _ in good}, model, nxt
+                )
+                self._log_writeback(spec, len(good), written)
         self._cursor[spec.name] = ids[-1]
         return len(ids)
+
+    async def _write_entities(
+        self, spec: TableSpec, good: list, embedded: dict[str, str], model: str, nxt: str,
+        *, live: bool = False,
+    ) -> int:
+        """Write entity vectors whose description is still what was embedded.
+
+        The recheck runs in the write transaction: the description is rebuilt
+        from the current ``entities``/``edges`` and compared with the text the
+        vector came from.
+        """
+        written = 0
+        async with self._engine.begin() as conn:
+            now = await self._describe(conn, [i for i, _ in good])
+            for i, v in good:
+                if now.get(i) != embedded[i]:
+                    continue
+                params = (
+                    {"vec": _lit(v), "model": model, "dim": len(v), "pk": i, "cur": nxt}
+                    if live
+                    else {"vec": _lit(v), "model": model, "pk": i, "next": nxt}
+                )
+                sql = self.store_live_sql(spec) if live else self.store_next_sql(spec)
+                res = await conn.execute(text(sql), params)
+                written += 1 if (res.rowcount or 0) > 0 else 0
+        return written
 
     # -- cluster centroids -------------------------------------------------
 
@@ -850,7 +929,8 @@ class ReembedWorker:
     def stale_claim_sql(spec: TableSpec, *, skip: bool) -> str:
         skip_sql = f" AND t.{spec.pk} <> ALL(CAST(:skip AS uuid[]))" if skip else ""
         return (
-            f"SELECT t.{spec.pk} AS pk, {spec.src} AS src FROM {spec.source_from} "
+            f"SELECT t.{spec.pk} AS pk, {spec.src} AS src, md5({spec.src}) AS seen "
+            f"FROM {spec.source_from} "
             f"WHERE t.{spec.vec} IS NOT NULL AND t.embedding_model IS NOT NULL "
             f"AND t.embedding_model <> :cur{skip_sql} "
             f"ORDER BY t.{spec.pk} LIMIT :limit FOR NO KEY UPDATE OF t SKIP LOCKED"
@@ -858,11 +938,31 @@ class ReembedWorker:
 
     @staticmethod
     def store_live_sql(spec: TableSpec) -> str:
+        """Write a healed live vector, only while the row is still stale.
+
+        ``embedding_model <> :cur`` is the stale predicate again, so a second
+        worker (or a writer that already stored a current-model vector) makes
+        this a no-op. A ``text`` row's source must also still hash to ``:seen``.
+        """
+        stale = (
+            f"t.{spec.vec} IS NOT NULL AND t.embedding_model IS NOT NULL "
+            f"AND t.embedding_model <> :cur"
+        )
+        if spec.kind == "text":
+            return (
+                f"UPDATE {spec.name} u SET {spec.vec} = CAST(:vec AS vector), "
+                f"embedding_model = :model, embedding_dim = :dim, "
+                f"embedding_next = NULL, embedding_next_model = NULL FROM ("
+                f"SELECT t.{spec.pk} AS pk FROM {spec.source_from} "
+                f"WHERE t.{spec.pk} = CAST(:pk AS uuid) AND {stale} "
+                f"AND md5({spec.src}) IS NOT DISTINCT FROM :seen) c "
+                f"WHERE u.{spec.pk} = c.pk"
+            )
         return (
-            f"UPDATE {spec.name} SET {spec.vec} = CAST(:vec AS vector), "
+            f"UPDATE {spec.name} t SET {spec.vec} = CAST(:vec AS vector), "
             f"embedding_model = :model, embedding_dim = :dim, "
             f"embedding_next = NULL, embedding_next_model = NULL "
-            f"WHERE {spec.pk} = CAST(:pk AS uuid)"
+            f"WHERE t.{spec.pk} = CAST(:pk AS uuid) AND {stale}"
         )
 
     @staticmethod
@@ -899,33 +999,38 @@ class ReembedWorker:
                 continue
             for _ in range(LEGACY_MAX_BATCHES_PER_PASS):
                 try:
-                    n = await self._stale_batch(spec, rec, cur, key)
+                    handled, written = await self._stale_batch(spec, rec, cur, key)
                 except Exception as exc:  # noqa: BLE001 - one table must not stall the rest
                     log.warning("reembed.stale_failed", table=spec.name, error=str(exc)[:200])
                     break
-                total += n
-                if n == 0:
+                total += written
+                if handled == 0:
                     break
         if total:
             log.info("reembed.stale_healed", rows=total, model=cur)
         return total
 
-    async def _stale_batch(self, spec: TableSpec, rec: SpaceRecord, cur: str, key: str) -> int:
+    async def _stale_batch(
+        self, spec: TableSpec, rec: SpaceRecord, cur: str, key: str
+    ) -> tuple[int, int]:
+        """One stale batch. Returns ``(rows handled, rows written)``."""
         if spec.kind == "episode":
             async with self._engine.begin() as conn:
                 res = await conn.execute(
                     text(self.episode_stale_copy_sql()), {"cur": cur, "limit": self._batch}
                 )
-            return res.rowcount or 0
+            n = res.rowcount or 0
+            return n, n
         skip = [k[1] for k in self._skipped if k[0] == spec.name and k[2] == key]
         params: dict[str, Any] = {"cur": cur, "limit": self._batch}
         if skip:
             params["skip"] = skip
+        # CLAIM: a short transaction, committed before anything is embedded.
         async with self._engine.connect() as conn:
             async with conn.begin():
                 if spec.kind == "entity":
                     sql = (
-                        "SELECT t.entity_id, NULL FROM entity_embeddings t WHERE "
+                        "SELECT t.entity_id, NULL, NULL FROM entity_embeddings t WHERE "
                         "t.embedding IS NOT NULL AND t.embedding_model IS NOT NULL "
                         "AND t.embedding_model <> :cur"
                         + (" AND t.entity_id <> ALL(CAST(:skip AS uuid[]))" if skip else "")
@@ -936,6 +1041,7 @@ class ReembedWorker:
                     desc = await self._describe(conn, ids) if ids else {}
                     pks = [i for i in ids if i in desc]
                     texts = [desc[i] for i in pks]
+                    seen: dict[str, Optional[str]] = {}
                 else:
                     rows = (
                         await conn.execute(text(self.stale_claim_sql(spec, skip=bool(skip))), params)
@@ -945,20 +1051,28 @@ class ReembedWorker:
                         (r[1][:ENTRY_CLIP_CHARS] if spec.name == "noo_entries" else r[1]) or ""
                         for r in rows
                     ]
-                if not rows:
-                    return 0
-                if pks:
-                    vecs, served = await self._embed_rows(spec, pks, texts, self._embed_live, key)
-                    good = [(pk, v) for pk, v in zip(pks, vecs) if v is not None]
-                    if good:
-                        model = self._check_vectors(
-                            [v for _, v in good], served, rec, len(good), live=True
-                        )
-                        await conn.execute(
-                            text(self.store_live_sql(spec)),
-                            [
-                                {"vec": _lit(v), "model": model, "dim": len(v), "pk": pk}
-                                for pk, v in good
-                            ],
-                        )
-        return len(rows)
+                    seen = {str(r[0]): r[2] for r in rows}
+        if not rows:
+            return 0, 0
+        written = 0
+        if pks:
+            # EMBED: no transaction and no connection held.
+            vecs, served = await self._embed_rows(spec, pks, texts, self._embed_live, key)
+            good = [(pk, v) for pk, v in zip(pks, vecs) if v is not None]
+            if good:
+                model = self._check_vectors(
+                    [v for _, v in good], served, rec, len(good), live=True
+                )
+                # WRITE BACK: only rows that are still stale and unchanged.
+                if spec.kind == "entity":
+                    written = await self._write_entities(
+                        spec, good, dict(zip(pks, texts)), model, cur, live=True
+                    )
+                else:
+                    written = await self._write_back(
+                        self.store_live_sql(spec),
+                        [{"vec": _lit(v), "model": model, "dim": len(v), "pk": pk,
+                          "seen": seen.get(pk), "cur": cur} for pk, v in good],
+                    )
+                self._log_writeback(spec, len(good), written)
+        return len(rows), written
