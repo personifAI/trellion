@@ -257,8 +257,9 @@ class PageIndexEmbedder:
     async def _gather_batches(self, one, batch_size: int) -> int:
         """Run up to ``throttle.max_inflight`` claimed batches concurrently.
 
-        Each batch claims its own disjoint rows; a batch that fails rolls back
-        and releases its rows without failing its siblings. With
+        Each batch picks its own disjoint rows (picks take turns, and a row
+        stays excluded until its batch ends); a batch that fails releases its
+        rows without failing its siblings. With
         ``max_inflight == 1`` this is one batch at a time, as before.
         """
         n = max(1, self.throttle.max_inflight)
@@ -266,7 +267,9 @@ class PageIndexEmbedder:
         return sum(done)
 
     async def process_unembedded_pages(self, batch_size: int = 32) -> int:
-        """Claim unembedded pages, embed, store. Returns count embedded."""
+        """Pick unembedded pages, embed, write back. Returns count written.
+
+        No transaction is open during the embed (see ``EmbedClaim``)."""
         return await self._gather_batches(self._page_batch, batch_size)
 
     async def process_unembedded_chunks(self, batch_size: int = 32) -> int:
@@ -276,6 +279,7 @@ class PageIndexEmbedder:
     async def _page_batch(self, batch_size: int) -> int:
         stage = "claim"
         pages: list[dict] = []
+        written: set[str] = set()
         stored = 0
         try:
             async with self.store.claim_unembedded_pages(
@@ -290,6 +294,7 @@ class PageIndexEmbedder:
                 stored = await claim.store(
                     [(p["page_id"], e) for p, e in zip(pages, embeddings)]
                 )
+                written = set(claim.written)
         except EmbedUnavailable as exc:
             # Expected under load: one line, no traceback, rows released.
             log.warning(
@@ -307,7 +312,7 @@ class PageIndexEmbedder:
             )
             return 0
 
-        for page in pages[:stored]:
+        for page in (p for p in pages if p["page_id"] in written):
             try:
                 await self._publish_page_embedded(page["page_id"])
             except Exception:
@@ -319,6 +324,7 @@ class PageIndexEmbedder:
     async def _chunk_batch(self, batch_size: int) -> int:
         stage = "claim"
         chunks: list[dict] = []
+        written: set[str] = set()
         stored = 0
         try:
             async with self.store.claim_unembedded_chunks(
@@ -333,6 +339,7 @@ class PageIndexEmbedder:
                 stored = await claim.store(
                     [(c["chunk_id"], e) for c, e in zip(chunks, embeddings)]
                 )
+                written = set(claim.written)
         except EmbedUnavailable as exc:
             log.warning(
                 "chunk_embed_batch_failed",
@@ -349,7 +356,7 @@ class PageIndexEmbedder:
             )
             return 0
 
-        for chunk in chunks[:stored]:
+        for chunk in (c for c in chunks if c["chunk_id"] in written):
             try:
                 await self._publish_chunk_embedded(chunk["chunk_id"], chunk.get("page_id"))
             except Exception:

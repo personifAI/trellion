@@ -253,9 +253,11 @@ async def test_the_backlog_loop_and_the_reembed_are_wired_to_bulk(monkeypatch):
     class Claim:
         rows = [{"page_id": "p1", "text": "hello"}, {"page_id": "p2", "text": "x"}]
         stored: list = []
+        written: list = []
 
         async def store(self, items):
             Claim.stored = items
+            Claim.written = [i for i, _ in items]
             return len(items)
 
     class Ctx:
