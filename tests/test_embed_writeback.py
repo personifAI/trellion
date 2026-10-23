@@ -412,7 +412,7 @@ async def test_a_row_picked_by_two_workers_is_written_once_and_the_first_vector_
         assert await a.store([(row[ident], vec(1.0))]) == 1
         assert await b.store([(row[ident], vec(2.0))]) == 0  # already embedded: a no-op
         assert a.written == [row[ident]] and b.written == []
-    got = await _fetch(store, f"SELECT embedding[1] FROM {col} WHERE {ident} = CAST(:i AS uuid)",
+    got = await _fetch(store, f"SELECT (embedding::real[])[1] FROM {col} WHERE {ident} = CAST(:i AS uuid)",
                        i=row[ident])
     assert [float(r[0]) for r in got] == [1.0]
 
