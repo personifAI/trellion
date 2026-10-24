@@ -46,9 +46,11 @@ def _fresh_throttle(monkeypatch: pytest.MonkeyPatch):
 class _FakeClaim:
     def __init__(self, store, rows) -> None:
         self._store, self.rows = store, rows
+        self.written: list[str] = []
 
     async def store(self, items):
         ids = [i for i, _ in items]
+        self.written = ids
         self._store.stored.extend(ids)
         self._store.pending = [p for p in self._store.pending if p["page_id"] not in ids]
         return len(items)

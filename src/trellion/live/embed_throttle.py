@@ -68,10 +68,12 @@ class EmbedUnavailable(Exception):  # noqa: N818 - reads as a condition, not an 
     it as an unexpected failure.
     """
 
-    def __init__(self, reason: str, attempts: int) -> None:
+    def __init__(self, reason: str, attempts: int, retry_after: float | None = None) -> None:
         super().__init__(f"{reason} after {attempts} attempts")
         self.reason = reason
         self.attempts = attempts
+        # The last Retry-After the gateway sent, when it sent one.
+        self.retry_after = retry_after
 
 
 def retry_after_seconds(resp: httpx.Response | None) -> float | None:
@@ -210,6 +212,7 @@ class EmbedThrottle:
         """
         attempts = max_attempts or self.max_attempts
         last_reason = "unknown"
+        last_retry_after: float | None = None
         for attempt in range(1, attempts + 1):
             try:
                 if bounded:
@@ -226,6 +229,10 @@ class EmbedThrottle:
                 if reason is None:
                     raise
                 last_reason = reason
+                if isinstance(exc, EmbedUnavailable):
+                    last_retry_after = exc.retry_after
+                elif isinstance(exc, httpx.HTTPStatusError):
+                    last_retry_after = retry_after_seconds(exc.response)
                 self.record_failure()
                 if attempt >= attempts:
                     break
@@ -245,7 +252,7 @@ class EmbedThrottle:
                 continue
             self.record_success()
             return result
-        raise EmbedUnavailable(last_reason, attempts)
+        raise EmbedUnavailable(last_reason, attempts, last_retry_after)
 
     def _enter(self) -> None:
         self.inflight += 1

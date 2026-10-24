@@ -13,8 +13,8 @@ license-files = ["LICENSE"]
 dependencies = [
     # The interface trellion offers add-ons (Apache-2.0, its own repo). Pinned
     # by full commit SHA, never by tag alone: tags can be moved.
-    # v0.1.0
-    "trellion-protocols @ git+https://github.com/personifAI/trellion-protocols.git@2da35d20bbe693b38616da626fd75b2d05d58e91",
+    # v0.2.0
+    "trellion-protocols @ git+https://github.com/personifAI/trellion-protocols.git@e98db73242cc695cbbdaa004f977d00ffbf3e186",
     # I/O + orchestration
     "typer>=0.12",
     "pydantic>=2.7",

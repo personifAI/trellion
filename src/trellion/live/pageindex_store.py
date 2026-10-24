@@ -14,6 +14,7 @@ embeddings, entities, mentions, and graph edges.
 from __future__ import annotations
 
 from .. import json_fast as json
+import asyncio
 import os
 import uuid
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -33,30 +34,46 @@ log = structlog.get_logger(__name__)
 
 
 class EmbedClaim:
-    """Rows locked for embedding, plus the transaction that holds the lock.
+    """Rows picked for embedding, and the recheck-guarded write-back.
 
-    ``rows`` are the claimed rows. ``store`` writes their vectors on the SAME
-    connection; the claim commits when the ``async with`` block exits cleanly
-    and rolls back (releasing the rows) when it raises.
+    ``rows`` are the picked rows, read in a short transaction that has already
+    committed: NO transaction or connection is held while the caller embeds
+    (with ``NOO_EMBED_BULK`` that wait is minutes). ``store`` writes the
+    vectors back in its own short transaction, and writes a row only if its
+    text is still what was read (``seen``, an md5 taken at pick time) AND it
+    still has no usable vector. A row that changed, vanished, was held, or was
+    already embedded by another worker is skipped and left for the next pass;
+    ``written`` lists the ids that were actually written.
     """
 
-    def __init__(self, rows: list[dict], conn: Any, upsert_sql: str, key: str, check, vec) -> None:
+    def __init__(self, rows: list[dict], engine: Any, upsert_sql: str, key: str, check, vec) -> None:
         self.rows = rows
-        self._conn = conn
+        self._engine = engine
         self._sql = upsert_sql
         self._key = key
         self._check = check
         self._vec = vec
+        self._seen = {r[key]: r.get("seen") for r in rows}
+        self.written: list[str] = []
 
     async def store(self, items: list[tuple[str, list[float]]]) -> int:
         if not items:
             return 0
         await self._check(items[0][1])
-        await self._conn.execute(
-            text(self._sql),
-            [{self._key: i, "vec": self._vec(e), **_provenance(e)} for i, e in items],
-        )
-        return len(items)
+        async with self._engine.begin() as conn:
+            for i, e in items:
+                res = await conn.execute(
+                    text(self._sql),
+                    {self._key: i, "vec": self._vec(e), "seen": self._seen.get(i),
+                     **_provenance(e)},
+                )
+                if (res.rowcount or 0) > 0:
+                    self.written.append(i)
+        skipped = len(items) - len(self.written)
+        if skipped:
+            log.info("embed_writeback_skipped", key=self._key, skipped=skipped,
+                     note="source changed, held, or already embedded; next pass retries")
+        return len(self.written)
 
 
 def _provenance(vector: Any) -> dict:
@@ -113,6 +130,11 @@ class PageIndexStore:
         self._embedding_dim = (
             embedding_dim if embedding_dim is not None else _get_embedding_dim()
         )
+        # ids this process has picked for embedding and not yet written back,
+        # per id column: concurrent batches here must not pick the same rows
+        # now that the pick holds no lock across the embed.
+        self._inflight: dict[str, set[str]] = {}
+        self._pick_lock = asyncio.Lock()
 
     # -- the add-on contract (trellion_protocols.GraphStore) -------------
     # Public names for what add-ons reach into
@@ -1023,42 +1045,57 @@ class PageIndexStore:
     #
     # Two processes (and several batches within one) drain the same backlog.
     # A plain "SELECT ... LIMIT n" hands every one of them the SAME first
-    # rows. The claim locks the child rows with FOR NO KEY UPDATE SKIP LOCKED
-    # and holds them in a transaction through embed + store, so concurrent
-    # claimers get disjoint rows; rollback releases them. Query-only: no
-    # schema change. NOT FOR UPDATE: the vector insert's foreign-key check
-    # takes FOR KEY SHARE on the parent row, which FOR UPDATE conflicts with
-    # (the claim would deadlock against its own store). A claimer that locks a
-    # row just after another committed it may re-embed it once (the join to the
-    # embedding table is not re-checked); the upsert makes that harmless.
+    # rows. The pick locks the child rows with FOR NO KEY UPDATE SKIP LOCKED
+    # so concurrent pickers get disjoint rows, reads each row's id and an md5
+    # of its text, and COMMITS: nothing is held while the caller embeds. NOT
+    # FOR UPDATE: the vector insert's foreign-key check takes FOR KEY SHARE on
+    # the parent row, which FOR UPDATE conflicts with.
+    #
+    # With no lock held across the embed, a row can be picked twice. Batches
+    # in this process never are (``_inflight`` excludes them from the pick);
+    # another process can, and that is harmless: the write-back inserts only
+    # where the text still hashes to what was read and the row still has no
+    # vector, so the second write is a no-op (rowcount 0, not counted).
 
     @asynccontextmanager
     async def _claim(
         self, select_sql: str, limit: int, upsert_sql: str, table: str, key: str
     ) -> AsyncIterator[EmbedClaim]:
-        async with self._engine.connect() as conn:
-            async with conn.begin():
-                result = await conn.execute(text(select_sql), {"limit": limit})
-                rows = [
-                    {k: (str(v) if k.endswith("_id") else v) for k, v in r._asdict().items()}
-                    for r in result.fetchall()
-                ]
+        inflight = self._inflight.setdefault(key, set())
+        # Picks in this process take turns: a pick that commits before the next
+        # one starts, and has registered its ids, cannot be handed out twice.
+        async with self._pick_lock:
+            async with self._engine.connect() as conn:
+                async with conn.begin():
+                    result = await conn.execute(
+                        text(select_sql), {"limit": limit, "skip": sorted(inflight)}
+                    )
+                    rows = [
+                        {k: (str(v) if k.endswith("_id") else v) for k, v in r._asdict().items()}
+                        for r in result.fetchall()
+                    ]
+            ids = {r[key] for r in rows}
+            inflight |= ids
 
-                async def check(vec: list[float]) -> None:
-                    await self._check_dims(table, vec)
+        async def check(vec: list[float]) -> None:
+            await self._check_dims(table, vec)
 
-                yield EmbedClaim(rows, conn, upsert_sql, key, check, self._vec)
+        try:
+            yield EmbedClaim(rows, self._engine, upsert_sql, key, check, self._vec)
+        finally:
+            inflight -= ids
 
     def claim_unembedded_pages(self, limit: int = 32) -> AbstractAsyncContextManager[EmbedClaim]:
         """Claim pages with no usable embedding (see :meth:`get_unembedded_pages`)."""
         return self._claim(
             """
-            SELECT p.page_id, p.text
+            SELECT p.page_id, p.text, md5(p.text) AS seen
             FROM pages p
             JOIN docs d ON d.doc_id = p.doc_id
             LEFT JOIN page_embeddings pe ON pe.page_id = p.page_id
             WHERE d.held_at IS NULL
               AND (pe.page_id IS NULL OR pe.embedding IS NULL)
+              AND p.page_id <> ALL(CAST(:skip AS uuid[]))
             ORDER BY p.page_id
             LIMIT :limit
             FOR NO KEY UPDATE OF p SKIP LOCKED
@@ -1066,13 +1103,17 @@ class PageIndexStore:
             limit,
             """
             INSERT INTO page_embeddings (page_id, embedding, embedding_model, embedding_dim)
-            VALUES (:page_id, CAST(:vec AS vector), :model, :dim)
+            SELECT p.page_id, CAST(:vec AS vector), CAST(:model AS text), CAST(:dim AS integer)
+            FROM pages p JOIN docs d ON d.doc_id = p.doc_id
+            WHERE p.page_id = CAST(:page_id AS uuid)
+              AND md5(p.text) = :seen AND d.held_at IS NULL
             ON CONFLICT (page_id) DO UPDATE SET
                 embedding = EXCLUDED.embedding,
                 embedding_model = EXCLUDED.embedding_model,
                 embedding_dim = EXCLUDED.embedding_dim,
                 embedding_next = NULL,
                 embedding_next_model = NULL
+            WHERE page_embeddings.embedding IS NULL
             """,
             "page_embeddings",
             "page_id",
@@ -1082,13 +1123,14 @@ class PageIndexStore:
         """Claim chunks with no usable embedding (see :meth:`get_unembedded_chunks`)."""
         return self._claim(
             """
-            SELECT c.chunk_id, c.page_id, c.text
+            SELECT c.chunk_id, c.page_id, c.text, md5(c.text) AS seen
             FROM page_chunks c
             JOIN pages p ON p.page_id = c.page_id
             JOIN docs d ON d.doc_id = p.doc_id
             LEFT JOIN chunk_embeddings ce ON ce.chunk_id = c.chunk_id
             WHERE d.held_at IS NULL
               AND (ce.chunk_id IS NULL OR ce.embedding IS NULL)
+              AND c.chunk_id <> ALL(CAST(:skip AS uuid[]))
             ORDER BY c.chunk_id
             LIMIT :limit
             FOR NO KEY UPDATE OF c SKIP LOCKED
@@ -1096,13 +1138,19 @@ class PageIndexStore:
             limit,
             """
             INSERT INTO chunk_embeddings (chunk_id, embedding, embedding_model, embedding_dim)
-            VALUES (:chunk_id, CAST(:vec AS vector), :model, :dim)
+            SELECT c.chunk_id, CAST(:vec AS vector), CAST(:model AS text), CAST(:dim AS integer)
+            FROM page_chunks c
+            JOIN pages p ON p.page_id = c.page_id
+            JOIN docs d ON d.doc_id = p.doc_id
+            WHERE c.chunk_id = CAST(:chunk_id AS uuid)
+              AND md5(c.text) = :seen AND d.held_at IS NULL
             ON CONFLICT (chunk_id) DO UPDATE SET
                 embedding = EXCLUDED.embedding,
                 embedding_model = EXCLUDED.embedding_model,
                 embedding_dim = EXCLUDED.embedding_dim,
                 embedding_next = NULL,
                 embedding_next_model = NULL
+            WHERE chunk_embeddings.embedding IS NULL
             """,
             "chunk_embeddings",
             "chunk_id",

@@ -530,7 +530,11 @@ def test_cutover_sql_swaps_one_table_and_only_staged_rows():
         assert sql.rstrip().endswith("WHERE embedding_next_model = :next")
 
 
-def test_entity_description_is_the_intel_format():
+def test_entity_description_is_the_shared_protocols_recipe():
+    from trellion_protocols import embedding_text
+
+    # one function, not a copy: the entity-vector writer calls the same one
+    assert reembed.entity_description is embedding_text.entity_description
     assert reembed.entity_description("python", "language", []) == "python (language)"
     nb = [
         {"name": "memory leaks", "type": "concept", "rel_type": "CAUSES", "direction": "outgoing"},
@@ -899,14 +903,195 @@ async def test_a_poison_row_is_retried_alone_then_skipped_and_the_migration_comp
     await w.report(nxt, cutover_done=False)
     # the skipped row counts as unsourced, so done can still reach total
     assert gw.puts[-1]["tables"]["page_embeddings"]["unsourced"] >= 1
-    # cutover drops the skipped row's old-model vector instead of leaving it
+    # cutover keeps the skipped row's vector under its OLD label (out of search:
+    # reads filter by model), not dropped and not relabelled
     gw.migration = {**filling(tag), "state": "cutover"}
     fresh_space()
     await w.run_pass()
-    got = {r[0]: r[1] for r in await _fetch(
-        store, "SELECT page_id::text, embedding_model FROM page_embeddings "
-        "WHERE page_id = ANY(CAST(:ids AS uuid[]))", ids=pids)}
-    assert got == {pids[0]: nxt, pids[1]: None, pids[2]: nxt}
+    sql = ("SELECT page_id::text, embedding_model, embedding IS NOT NULL FROM page_embeddings "
+           "WHERE page_id = ANY(CAST(:ids AS uuid[]))")
+    got = {r[0]: (r[1], r[2]) for r in await _fetch(store, sql, ids=pids)}
+    assert got == {pids[0]: (nxt, True), pids[1]: (f"m-{tag}", True), pids[2]: (nxt, True)}
+    # once the migration is over, the stale sweep retries it with the new model
+    gw.model, gw.migration, gw.poison = nxt, None, set()
+    fresh_space()
+    after = ReembedWorker(store.engine, e._embed_next, embed_live=e.embed_batch, batch_size=64)
+    await after.run_pass()
+    got = {r[0]: (r[1], r[2]) for r in await _fetch(store, sql, ids=pids)}
+    assert got[pids[1]] == (nxt, True)
+
+
+class _Ticks:
+    """A clock that jumps past PROGRESS_EVERY_S on every read: each pass reports."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        self.t += 1000.0
+        return self.t
+
+
+@needs_db
+async def test_an_episode_whose_traversal_record_is_skipped_does_not_block_completion(world, gw):
+    store, tag, make = world
+    gw.model = f"m-{tag}"
+    nxt = f"n-{tag}"
+    lit = "[" + ",".join(["1"] + ["0"] * (DIM - 1)) + "]"
+    frame, trav = str(uuid.uuid4()), str(uuid.uuid4())
+    try:
+        await store_exec(store, "INSERT INTO trellion_episodes (id, persona_id, record_type, "
+                         "index_name, content_summary, embedding, embedding_model) VALUES "
+                         "(CAST(:f AS uuid), 'p', 'traversal', 'traversals', 's', "
+                         "CAST(:v AS vector), :m)", f=frame, v=lit, m=f"m-{tag}")
+        await store_exec(store, "INSERT INTO trellion_traversal_records (id, persona_id, "
+                         "query_text, outcome_score, video_frame_id, query_embedding, "
+                         "embedding_model) VALUES (CAST(:t AS uuid), 'p', :q, 0.9, "
+                         "CAST(:f AS uuid), CAST(:v AS vector), :m)",
+                         t=trav, q=f"{tag} poison query", f=frame, v=lit, m=f"m-{tag}")
+        gw.poison = {f"{tag} poison query"}
+        gw.migration = filling(tag)
+        fresh_space()
+        w = ReembedWorker(store.engine, make_embedder(store, gw)._embed_next,
+                          batch_size=64, clock=_Ticks())
+        with structlog.testing.capture_logs() as logs:
+            await _fill_all(w, 4)
+        skipped = {(x["table"], x["pk"]) for x in logs if x["event"] == "reembed.row_skipped"}
+        # the record is skipped for its text; the episode because its only source went
+        assert ("trellion_traversal_records", trav) in skipped
+        assert ("trellion_episodes", frame) in skipped
+        # every episode the worker counts is staged: done can reach total
+        done, total, unsourced = (await w.counts(nxt))["trellion_episodes"]
+        assert done == total and unsourced >= 1
+
+        gw.migration = {**filling(tag), "state": "cutover"}
+        fresh_space()
+        await w.run_pass()
+
+        async def models():
+            ep = await _fetch(store, "SELECT embedding IS NOT NULL, embedding_model "
+                              "FROM trellion_episodes WHERE id = CAST(:f AS uuid)", f=frame)
+            tr = await _fetch(store, "SELECT query_embedding IS NOT NULL, embedding_model "
+                              "FROM trellion_traversal_records WHERE id = CAST(:t AS uuid)", t=trav)
+            return tuple(ep[0]), tuple(tr[0])
+
+        # both keep their vector under the OLD label: out of search, not lost
+        assert await models() == ((True, f"m-{tag}"), (True, f"m-{tag}"))
+        # after the migration the stale sweep re-embeds the record, then the
+        # episode copies from it (nothing else would ever re-embed the record)
+        gw.model, gw.migration, gw.poison = nxt, None, set()
+        fresh_space()
+        e = make_embedder(store, gw)
+        after = ReembedWorker(store.engine, e._embed_next, embed_live=e.embed_batch, batch_size=64)
+        await after.run_pass()
+        assert await models() == ((True, nxt), (True, nxt))
+    finally:
+        await store_exec(store, "DELETE FROM trellion_traversal_records WHERE id = CAST(:t AS uuid)", t=trav)
+        await store_exec(store, "DELETE FROM trellion_episodes WHERE id = CAST(:f AS uuid)", f=frame)
+
+
+@needs_db
+async def test_clusters_derive_from_what_is_left_and_skip_when_nothing_is(world, gw):
+    """A skipped member must not hold its cluster (or the cluster's parent) back.
+
+    keep: two members, one poison -> derived from the good one.
+    dead: one member, poison -> skipped; its parent (only child dead) -> skipped.
+    top: children keep + dead -> derived from keep alone.
+    """
+    store, tag, make = world
+    gw.model = f"m-{tag}"
+    nxt = f"n-{tag}"
+    lit = "[" + ",".join(["1"] + ["0"] * (DIM - 1)) + "]"
+    good, bad = str(uuid.uuid4()), str(uuid.uuid4())
+    keep, dead, dead_parent, top = (str(uuid.uuid4()) for _ in range(4))
+    names = {good: f"{tag}-good", bad: f"{tag}-bad"}
+    clusters = [keep, dead, dead_parent, top]
+    try:
+        for eid, name in names.items():
+            await store_exec(store, "INSERT INTO entities (entity_id, canonical_name, type) "
+                             "VALUES (CAST(:e AS uuid), :n, 'thing')", e=eid, n=name)
+            await store_exec(store, "INSERT INTO entity_embeddings (entity_id, embedding, "
+                             "embedding_model) VALUES (CAST(:e AS uuid), CAST(:v AS vector), :m)",
+                             e=eid, v=lit, m=f"m-{tag}")
+        for cid, level in ((top, 2), (dead_parent, 1), (keep, 0), (dead, 0)):
+            await store_exec(store, "INSERT INTO entity_clusters (cluster_id, name, level, "
+                             "centroid, member_count) VALUES (CAST(:c AS uuid), :n, :l, "
+                             "CAST(:v AS vector), 1)", c=cid, n=f"{tag}-{level}", l=level, v=lit)
+        for child, parent in ((keep, top), (dead_parent, top), (dead, dead_parent)):
+            await store_exec(store, "UPDATE entity_clusters SET parent_cluster_id = CAST(:p AS uuid) "
+                             "WHERE cluster_id = CAST(:c AS uuid)", p=parent, c=child)
+        for eid, cid in ((good, keep), (bad, keep), (bad, dead)):
+            await store_exec(store, "INSERT INTO entity_cluster_members (entity_id, cluster_id) "
+                             "VALUES (CAST(:e AS uuid), CAST(:c AS uuid))", e=eid, c=cid)
+
+        gw.poison = {f"{names[bad]} (thing)"}  # the description trellion-intel embeds
+        gw.migration = filling(tag)
+        fresh_space()
+        w = ReembedWorker(store.engine, make_embedder(store, gw)._embed_next,
+                          batch_size=64, clock=_Ticks())
+        with structlog.testing.capture_logs() as logs:
+            await _fill_all(w, 8)
+        skipped = {x["pk"] for x in logs if x["event"] == "reembed.row_skipped"}
+        assert {bad, dead, dead_parent} <= skipped
+        assert not {good, keep, top} & skipped
+
+        cl = {r[0]: (r[1], r[2]) for r in await _fetch(
+            store, "SELECT cluster_id::text, embedding_next_model, embedding_next::text "
+            "FROM entity_clusters WHERE cluster_id = ANY(CAST(:ids AS uuid[]))", ids=clusters)}
+        ent = (await _fetch(store, "SELECT embedding_next::text FROM entity_embeddings "
+                            "WHERE entity_id = CAST(:e AS uuid)", e=good))[0][0]
+        # keep = its one good member's vector (normalised: the fake's vectors are unit);
+        # top = keep's (its only live child)
+        assert cl[keep] == (nxt, ent)
+        assert cl[top] == (nxt, ent)
+        assert cl[dead][0] is None and cl[dead_parent][0] is None
+        done, total, _ = (await w.counts(nxt))["entity_clusters"]
+        assert done == total
+
+        gw.migration = {**filling(tag), "state": "cutover"}
+        fresh_space()
+        await w.run_pass()
+        got = {r[0]: r[1] for r in await _fetch(
+            store, "SELECT cluster_id::text, centroid IS NULL FROM entity_clusters "
+            "WHERE cluster_id = ANY(CAST(:ids AS uuid[]))", ids=clusters)}
+        assert got == {keep: False, top: False, dead: True, dead_parent: True}
+    finally:
+        await store_exec(store, "DELETE FROM entity_clusters "
+                         "WHERE cluster_id = ANY(CAST(:ids AS uuid[]))", ids=clusters)
+        await store_exec(store, "DELETE FROM entities WHERE entity_id = ANY(CAST(:ids AS uuid[]))",
+                         ids=list(names))
+
+
+@needs_db
+async def test_tied_neighbours_are_described_in_one_fixed_order(world, gw):
+    """Edges with equal (or NULL) confidence used to come back in any order.
+
+    Six neighbours tie (NULL confidence, one relation) and are inserted in
+    reverse name order, which is the order Postgres handed them back in before
+    the tie-break; one stronger edge, whose relation sorts last, still leads.
+    """
+    store, tag, make = world
+    ent, strong = str(uuid.uuid4()), str(uuid.uuid4())
+    tied = [str(uuid.uuid4()) for _ in range(6)]
+    names = {ent: f"{tag}-x", strong: f"{tag}-s"}
+    names.update({t: f"{tag}-n{5 - i}" for i, t in enumerate(tied)})
+    try:
+        for eid, name in names.items():
+            await store_exec(store, "INSERT INTO entities (entity_id, canonical_name, type) "
+                             "VALUES (CAST(:e AS uuid), :n, 't')", e=eid, n=name)
+        for dst, rel, conf in [(t, "R1", None) for t in tied] + [(strong, "R9", 2.0)]:
+            await store_exec(store, "INSERT INTO edges (edge_id, src_entity_id, dst_entity_id, "
+                             "rel_type, confidence) VALUES (gen_random_uuid(), CAST(:s AS uuid), "
+                             "CAST(:d AS uuid), :r, :c)", s=ent, d=dst, r=rel, c=conf)
+        w = ReembedWorker(store.engine, lambda t: None)
+        async with store.engine.connect() as conn:
+            got = await w._describe(conn, [ent])
+        want = ", ".join([f"R9 -> {tag}-s (t)"] + [f"R1 -> {tag}-n{i} (t)" for i in range(6)])
+        assert got[ent] == f"{tag}-x (t): {want}"
+    finally:
+        await store_exec(store, "DELETE FROM edges WHERE src_entity_id = CAST(:e AS uuid)", e=ent)
+        await store_exec(store, "DELETE FROM entities WHERE entity_id = ANY(CAST(:ids AS uuid[]))",
+                         ids=list(names))
 
 
 @needs_db
