@@ -172,6 +172,22 @@ Retried statuses: 429, 502, 503, 504, plus timeouts and transport errors.
 Every failed call halves the batch size (floor `BATCH_MIN`); every success adds
 `BATCH_STEP`.
 
+## Bulk embedding (`NOO_EMBED_BULK`)
+
+Background embedding (the re-embed, the page/chunk backlog, the graph entity
+sweep) can hand its batches to the gateway's job route
+(`POST /api/external/embeddings/jobs`) instead of holding a synchronous embed.
+Query-time embeds never do. Read at call time in `live/embed_bulk.py`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NOO_EMBED_BULK` | off | `1`/`true`/`yes`/`on` sends background embeds as jobs of at most 64 texts, two at a time, polled with backoff (0.5 s growing to 5 s). Off is exactly the synchronous call. A gateway answering 404/405 on submit is treated as old: trellion falls back to the synchronous call and logs once. |
+| `NOO_EMBED_BULK_TIMEOUT_S` | `900` | Overall wait for one `embed_bulk` call. A job still pending then raises `EmbedUnavailable` (`bulk_timeout`). |
+
+A 429/503 follows the throttle above (Retry-After honoured, then
+`EmbedUnavailable`); a job that ends `dead` is an ordinary error, so the
+re-embed retries those rows alone.
+
 ## LLM throttle and circuit breaker (`TRELLION_LLM_*`)
 
 Read once per process when the shared `LLMThrottle` is built
