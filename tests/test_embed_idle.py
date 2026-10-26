@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
 """An idle embedder is cheap: no vector-carrying join, and a backing-off poll.
 
 pop-os, 2026-10-26: the backlog pick ``LEFT JOIN chunk_embeddings ... WHERE
