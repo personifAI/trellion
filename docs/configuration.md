@@ -149,6 +149,17 @@ See "Source priors" in [architecture.md](architecture.md) for
 how priors change scores. If the reader and the writer do not share the file,
 priors stay neutral.
 
+## Background loops (`TRELLION_BACKGROUND_WORKERS`)
+
+`PageIndexRAG.startup()` (`live/rag_integration.py`) starts the backlog loops:
+page and chunk embedding, entity extraction, graph building and, when an
+add-on provides them, enrichment and graph metrics. Set
+`TRELLION_BACKGROUND_WORKERS=0` (also `false`, `off`, `no`) on a process that
+must not run them because another process on the same database does. That
+process still serves queries and ingests; the other one picks up its new rows
+on its next poll. Unset or any other value: the loops run. Every loop claims
+its rows, so two runners stay correct, but each polls Postgres on its own.
+
 ## Embed throttle (`TRELLION_EMBED_*`)
 
 Read once per process when the shared `EmbedThrottle` is built
