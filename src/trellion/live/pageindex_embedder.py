@@ -42,6 +42,9 @@ from trellion.live.reembed import ReembedWorker
 
 log = structlog.get_logger(__name__)
 
+# Longest wait between idle backlog polls; a parsed doc wakes the loop sooner.
+IDLE_MAX_S = 60.0
+
 
 class EmbedderState(str, Enum):
     IDLE = "idle"
@@ -107,6 +110,8 @@ class PageIndexEmbedder:
         self._task: Optional[asyncio.Task] = None
         self._client: Optional[httpx.AsyncClient] = None
         self._wake_event = asyncio.Event()
+        # Idle polls in a row; the idle wait doubles with each (see _run_loop).
+        self._idle_streak = 0
         self._stop_event = asyncio.Event()
         # Provenance upkeep + space re-embed (live/reembed.py). Built on
         # start(), once the store's engine is known to be usable.
@@ -571,15 +576,23 @@ class PageIndexEmbedder:
                     continue
 
                 if total == 0:
-                    # Nothing to process - wait for interval or wake event
+                    # Nothing to process - wait for the wake event (a parsed
+                    # doc) or the idle interval, which doubles per idle poll
+                    # up to IDLE_MAX_S: an empty backlog polled every 5 s from
+                    # every process was steady database load for nothing.
                     self._wake_event.clear()
+                    wait = min(interval * (2 ** self._idle_streak), max(interval, IDLE_MAX_S))
+                    self._idle_streak = min(self._idle_streak + 1, 16)
                     try:
                         await asyncio.wait_for(
-                            self._wake_event.wait(), timeout=interval
+                            self._wake_event.wait(), timeout=wait
                         )
+                        self._idle_streak = 0
                     except asyncio.TimeoutError:
                         pass
                     continue
+
+                self._idle_streak = 0
 
                 # More work remains: pace the drain instead of hammering. After
                 # failed batches the rest grows (jittered exponential), so a
