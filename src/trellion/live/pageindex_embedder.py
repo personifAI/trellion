@@ -107,6 +107,7 @@ class PageIndexEmbedder:
         self._task: Optional[asyncio.Task] = None
         self._client: Optional[httpx.AsyncClient] = None
         self._wake_event = asyncio.Event()
+        self._doc_wake = None  # DocWakeListener, opened only by start()
         # Idle polls in a row; the idle wait doubles with each (see _run_loop).
         self._idle_streak = 0
         self._stop_event = asyncio.Event()
@@ -446,6 +447,20 @@ class PageIndexEmbedder:
             await self._client.aclose()
             self._client = None
 
+    async def _start_doc_wake_listener(self) -> None:
+        """LISTEN for ingested documents (from any process) to wake the loop."""
+        engine = getattr(self.store, "_engine", None)
+        if engine is None or self._doc_wake is not None:
+            return
+        from .doc_wake import DocWakeListener, conninfo_from_engine
+
+        try:
+            self._doc_wake = DocWakeListener(conninfo_from_engine(engine), self._wake_event.set)
+            await self._doc_wake.start()
+        except Exception:
+            log.warning("pageindex_embedder.doc_wake_unavailable", exc_info=True)
+            self._doc_wake = None
+
     async def start(self, interval: float = 5.0) -> bool:
         """Start the background embedding loop.
 
@@ -466,6 +481,7 @@ class PageIndexEmbedder:
         self._http()
 
         await self._subscribe_doc_parsed()
+        await self._start_doc_wake_listener()
 
         engine = getattr(self.store, "_engine", None)
         self._reembed = (
@@ -504,6 +520,9 @@ class PageIndexEmbedder:
                 self._task.cancel()
                 log.warning("pageindex_embedder_force_cancelled")
 
+        if self._doc_wake is not None:
+            await self._doc_wake.stop()
+            self._doc_wake = None
         await self.aclose()
 
         self.state = EmbedderState.IDLE

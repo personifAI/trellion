@@ -178,7 +178,7 @@ these are set by the stack, so the defaults below are what runs.
 | `TRELLION_EMBED_BACKOFF_CAP_S` | `60.0` | none | Ceiling for backoff and for honoured `Retry-After`. |
 | `TRELLION_EMBED_PACE_S` | `0.5` | none | Rest between batches after a success. After consecutive failures the rest is a backoff delay instead. |
 | `TRELLION_EMBED_STARTUP_JITTER_S` | `30.0` | `0` disables | Each loop waits `uniform(0, value)` before its first pass, so containers restarted together do not begin together. |
-| `TRELLION_EMBED_IDLE_MAX_S` | `10.0` | none | Longest wait between backlog polls while there is nothing to embed (the wait starts at 5 s and doubles up to this). It is also the most a newly ingested document waits before it is embedded and citable: in the stack, ingest and the embedding loop run in different containers, so no wake-up reaches the loop. |
+| `TRELLION_EMBED_IDLE_MAX_S` | `10.0` | none | Longest wait between backlog polls while there is nothing to embed (the wait starts at 5 s and doubles up to this). It fallback-bounds how long a newly ingested document waits before it is embedded and citable: the normal wake is Postgres LISTEN/NOTIFY (ingest NOTIFYs `trellion_doc_parsed`, the embedder LISTENs on a direct, non-transaction-pooled connection), so the first embed starts in about a second, and this idle cap is only the fallback. |
 
 Retried statuses: 429, 502, 503, 504, plus timeouts and transport errors.
 Every failed call halves the batch size (floor `BATCH_MIN`); every success adds
