@@ -42,9 +42,6 @@ from trellion.live.reembed import ReembedWorker
 
 log = structlog.get_logger(__name__)
 
-# Longest wait between idle backlog polls; a parsed doc wakes the loop sooner.
-IDLE_MAX_S = 60.0
-
 
 class EmbedderState(str, Enum):
     IDLE = "idle"
@@ -595,10 +592,10 @@ class PageIndexEmbedder:
                 if total == 0:
                     # Nothing to process - wait for the wake event (a parsed
                     # doc) or the idle interval, which doubles per idle poll
-                    # up to IDLE_MAX_S: an empty backlog polled every 5 s from
+                    # up to throttle.idle_max_s: an empty backlog polled every 5 s from
                     # every process was steady database load for nothing.
                     self._wake_event.clear()
-                    wait = min(interval * (2 ** self._idle_streak), max(interval, IDLE_MAX_S))
+                    wait = min(interval * (2 ** self._idle_streak), max(interval, self.throttle.idle_max_s))
                     self._idle_streak = min(self._idle_streak + 1, 16)
                     try:
                         await asyncio.wait_for(
