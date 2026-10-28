@@ -48,7 +48,10 @@ class _Loop:
 
 
 class _Embedder(_Loop):
-    pass
+    closed = False
+
+    async def aclose(self):
+        _Embedder.closed = True
 
 
 class _Extractor(_Loop):
@@ -58,6 +61,7 @@ class _Extractor(_Loop):
 @pytest.fixture
 def rag(monkeypatch):
     _Loop.started, _Loop.stopped = [], []
+    _Embedder.closed = False
     monkeypatch.setattr(ri, "PageIndexSchema", _Schema)
     monkeypatch.setattr(ri, "PageIndexStore", _Store)
     monkeypatch.setattr(ri, "PageIndexEmbedder", _Embedder)
@@ -75,6 +79,7 @@ async def test_off_starts_no_loop_and_still_serves(rag, monkeypatch, value):
     assert rag._started and rag.retriever is not None and rag.orchestrator is not None
     await rag.shutdown()
     assert _Loop.stopped == []
+    assert _Embedder.closed, "the client a query may have opened is closed"
     assert rag.store.closed
 
 
@@ -88,3 +93,40 @@ async def test_on_by_default(rag, monkeypatch, value):
     assert _Loop.started == ["_Embedder", "_Extractor"]
     await rag.shutdown()
     assert _Loop.stopped == ["_Extractor", "_Embedder"]
+
+
+async def test_off_still_embeds_a_query(monkeypatch):
+    """0.6.13-rc.2/rc.3 rehearsal: with the loops off, every rag.query failed
+    503 with a blank error. The embedder's gateway client was made only in
+    start(), and embed_text asserted on it: a bare AssertionError, empty text."""
+    import httpx
+
+    from trellion.live import pageindex_embedder as pe_mod
+
+    seen = []
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"model": "m", "data": [{"index": 0, "embedding": [0.5, 0.25]}]})
+
+    real_client = httpx.AsyncClient
+
+    def client(**kw):
+        kw.pop("verify", None), kw.pop("cert", None), kw.pop("auth", None)
+        return real_client(transport=httpx.MockTransport(gateway), **kw)
+
+    monkeypatch.setattr(pe_mod.httpx, "AsyncClient", client)
+    monkeypatch.setattr(ri, "PageIndexSchema", _Schema)
+    monkeypatch.setattr(ri, "PageIndexStore", _Store)
+    monkeypatch.setattr(ri, "_ENTITY_EXTRACTOR_AVAILABLE", False)
+    monkeypatch.setattr(ri, "_GRAPH_BUILDER_AVAILABLE", False)
+    monkeypatch.setenv(ri.BACKGROUND_WORKERS_ENV, "0")
+
+    rag = ri.PageIndexRAG(dsn="postgresql://x/y", embedding_url="https://gateway:8080")
+    await rag.startup()
+    assert rag.retriever.embedder is rag.embedder
+    vec = await rag.embedder.embed_text("what changed?")
+    assert list(vec) == [0.5, 0.25]
+    assert seen == ["/api/external/embeddings"]
+    await rag.shutdown()
+    assert rag.embedder._client is None, "shutdown closes the client the query opened"

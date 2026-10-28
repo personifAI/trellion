@@ -346,6 +346,9 @@ class PageIndexRAG:
                 log.warning("pageindex_rag.clusterer_close_failed", exc_info=True)
         if self._background:
             await self._stop_background_workers()
+        elif self.embedder:
+            # Queries opened its client even with the loops off.
+            await self.embedder.aclose()
 
         if self.generator:
             await self.generator.close()
