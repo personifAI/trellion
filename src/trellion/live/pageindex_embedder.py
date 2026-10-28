@@ -129,7 +129,7 @@ class PageIndexEmbedder:
         Not bounded by the backfill semaphore, so a query is never queued
         behind a backlog drain; fewer retries so it fails fast.
         """
-        assert self._client is not None
+        self._http()
 
         out = await self.throttle.call(
             lambda: self._embed_gateway([text]),
@@ -145,7 +145,7 @@ class PageIndexEmbedder:
         """
         if not texts:
             return []
-        assert self._client is not None
+        self._http()
 
         return await self.throttle.call(
             lambda: self._embed_gateway(texts), what="batch", count=len(texts)
@@ -179,7 +179,7 @@ class PageIndexEmbedder:
         vectors that also carries the model the RESPONSE named (``.model``,
         and on each vector), which is what a writer records as provenance.
         """
-        resp = await self._client.post(
+        resp = await self._http().post(
             f"{self.embedding_url}/api/external/embeddings",
             json={"input": inputs, "model": model or embedding_space.space_name()},
         )
@@ -189,7 +189,7 @@ class PageIndexEmbedder:
 
     async def _embed_next(self, texts: list[str]) -> embedding_space.Embeddings:
         """Embed with the space's NEXT model (a running migration)."""
-        assert self._client is not None
+        self._http()
         return await self.throttle.call(
             lambda: self._embed_gateway(texts, embedding_space.next_alias()),
             what="reembed", count=len(texts),
@@ -213,7 +213,7 @@ class PageIndexEmbedder:
         """
         if not texts:
             return embedding_space.Embeddings([])
-        assert self._client is not None
+        self._http()
         if not _bulk.enabled() or self._bulk_unsupported:
             return await self.throttle.call(
                 lambda: self._embed_gateway(texts, model),
@@ -223,7 +223,7 @@ class PageIndexEmbedder:
         async def attempt() -> embedding_space.Embeddings:
             try:
                 return await _bulk.embed_bulk(
-                    self._client, self.embedding_url, texts,
+                    self._http(), self.embedding_url, texts,
                     model or embedding_space.space_name(),
                 )
             except _bulk.BulkUnsupported as exc:
@@ -421,6 +421,34 @@ class PageIndexEmbedder:
     # Lifecycle (state machine)
     # ------------------------------------------------------------------
 
+    def _http(self) -> httpx.AsyncClient:
+        """The gateway client, made on first use.
+
+        Not tied to :meth:`start`: a process that runs no backlog loop
+        (TRELLION_BACKGROUND_WORKERS=0) still embeds every query through it.
+        It was made only in ``start()`` and checked with a bare ``assert``, so
+        with the loops off every query raised an AssertionError whose text
+        is empty (0.6.13-rc.2/rc.3 rehearsal: rag.query 503, blank error).
+        """
+        if self._client is None:
+            # The credential rides the shared auth hook, not a header built per
+            # call: the hook re-signs each request, falls back to the key when a
+            # surface refuses an exchanged token, and backs off on a refusal
+            # (noomesh followup 436a). This path was the 2026-09-22 403 storm,
+            # and a hand-built header had none of the three.
+            from trellion.live.gateway_auth import GatewayHmacAuth
+
+            self._client = httpx.AsyncClient(
+                timeout=60.0, verify=ssl_verify(), cert=client_cert(), auth=GatewayHmacAuth()
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the gateway client, whether or not the loop ever ran."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
     async def start(self, interval: float = 5.0) -> bool:
         """Start the background embedding loop.
 
@@ -438,16 +466,7 @@ class PageIndexEmbedder:
         self._wake_event.clear()
         self._stop_event.clear()
         self.state = EmbedderState.RUNNING
-        # The credential rides the shared auth hook, not a header built per
-        # call: the hook re-signs each request, falls back to the key when a
-        # surface refuses an exchanged token, and backs off on a refusal
-        # (noomesh followup 436a). This path was the 2026-09-22 403 storm,
-        # and a hand-built header had none of the three.
-        from trellion.live.gateway_auth import GatewayHmacAuth
-
-        self._client = httpx.AsyncClient(
-            timeout=60.0, verify=ssl_verify(), cert=client_cert(), auth=GatewayHmacAuth()
-        )
+        self._http()
 
         await self._subscribe_doc_parsed()
 
@@ -488,9 +507,7 @@ class PageIndexEmbedder:
                 self._task.cancel()
                 log.warning("pageindex_embedder_force_cancelled")
 
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        await self.aclose()
 
         self.state = EmbedderState.IDLE
         log.info("pageindex_embedder_stopped")
