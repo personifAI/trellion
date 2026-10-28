@@ -53,12 +53,13 @@ log = structlog.get_logger(__name__)
 RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 
 # Default longest wait between idle backlog polls (TRELLION_EMBED_IDLE_MAX_S).
-# It is also the most a newly ingested document waits to be embedded: the
-# doc-parsed wake reaches the loop only when it runs in the ingesting process
-# and that process has a bus handle, and in the stack it has neither (the
-# loop runs in trellion-intel, ingest in trellion). 60 s made the first
-# citation of a console upload take 37-40 s (0.6.13 rehearsal). The idle poll
-# is two NOT EXISTS index probes, so 10 s costs nothing that matters.
+# It is also the most a newly ingested document waits if its wake is missed:
+# ingest NOTIFYs Postgres (live/doc_wake.py) and the embedder LISTENs, so the
+# wake crosses containers through the shared database; this cap is the
+# fallback. (Before that, the wake only reached a loop in the ingesting
+# process and 60 s made the first citation of a console upload take 37-40 s,
+# 0.6.13 rehearsal.) The idle poll is two NOT EXISTS index probes, so 10 s
+# costs nothing that matters.
 IDLE_MAX_S = 10.0
 
 
