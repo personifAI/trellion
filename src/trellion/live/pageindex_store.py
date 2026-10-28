@@ -1006,9 +1006,9 @@ class PageIndexStore:
                 SELECT p.page_id, p.text
                 FROM pages p
                 JOIN docs d ON d.doc_id = p.doc_id
-                LEFT JOIN page_embeddings pe ON pe.page_id = p.page_id
                 WHERE d.held_at IS NULL
-                  AND (pe.page_id IS NULL OR pe.embedding IS NULL)
+                  AND NOT EXISTS (SELECT 1 FROM page_embeddings pe
+                                  WHERE pe.page_id = p.page_id AND pe.embedding IS NOT NULL)
                 ORDER BY p.page_id
                 LIMIT :limit
                 """),
@@ -1030,9 +1030,9 @@ class PageIndexStore:
                 FROM page_chunks c
                 JOIN pages p ON p.page_id = c.page_id
                 JOIN docs d ON d.doc_id = p.doc_id
-                LEFT JOIN chunk_embeddings ce ON ce.chunk_id = c.chunk_id
                 WHERE d.held_at IS NULL
-                  AND (ce.chunk_id IS NULL OR ce.embedding IS NULL)
+                  AND NOT EXISTS (SELECT 1 FROM chunk_embeddings ce
+                                  WHERE ce.chunk_id = c.chunk_id AND ce.embedding IS NOT NULL)
                 ORDER BY c.chunk_id
                 LIMIT :limit
                 """),
@@ -1042,6 +1042,13 @@ class PageIndexStore:
             return [{"chunk_id": str(r[0]), "text": r[1]} for r in rows]
 
     # -- claimed embedding backfill ---------------------------------------
+    #
+    # "Needs an embedding" is NOT EXISTS (a row with a non-NULL vector), not
+    # LEFT JOIN ... WHERE ce.embedding IS NULL. With the filter above the join
+    # the planner carries every vector through the hash join: 974 chunks made
+    # a ~136 MB hash that spilled to a temp file on EVERY idle poll (pop-os,
+    # 2026-10-26: ~130 MB/s of writes for a week). Inside NOT EXISTS the
+    # IS NOT NULL test reads only the null bitmap and the join keeps ids.
     #
     # Two processes (and several batches within one) drain the same backlog.
     # A plain "SELECT ... LIMIT n" hands every one of them the SAME first
@@ -1092,9 +1099,9 @@ class PageIndexStore:
             SELECT p.page_id, p.text, md5(p.text) AS seen
             FROM pages p
             JOIN docs d ON d.doc_id = p.doc_id
-            LEFT JOIN page_embeddings pe ON pe.page_id = p.page_id
             WHERE d.held_at IS NULL
-              AND (pe.page_id IS NULL OR pe.embedding IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM page_embeddings pe
+                              WHERE pe.page_id = p.page_id AND pe.embedding IS NOT NULL)
               AND p.page_id <> ALL(CAST(:skip AS uuid[]))
             ORDER BY p.page_id
             LIMIT :limit
@@ -1127,9 +1134,9 @@ class PageIndexStore:
             FROM page_chunks c
             JOIN pages p ON p.page_id = c.page_id
             JOIN docs d ON d.doc_id = p.doc_id
-            LEFT JOIN chunk_embeddings ce ON ce.chunk_id = c.chunk_id
             WHERE d.held_at IS NULL
-              AND (ce.chunk_id IS NULL OR ce.embedding IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM chunk_embeddings ce
+                              WHERE ce.chunk_id = c.chunk_id AND ce.embedding IS NOT NULL)
               AND c.chunk_id <> ALL(CAST(:skip AS uuid[]))
             ORDER BY c.chunk_id
             LIMIT :limit

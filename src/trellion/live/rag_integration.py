@@ -12,6 +12,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import structlog
@@ -85,6 +86,19 @@ _GRAPH_CLUSTERER_AVAILABLE = _cluster_builder_factory is not None
 
 log = structlog.get_logger(__name__)
 
+#: Set to 0 on a process that must not run the backlog loops because another
+#: process on the same database runs them. Every loop claims its rows, so two
+#: runners stay correct, but each one polls Postgres on its own (pop-os,
+#: 2026-10-26: an add-on container built on this image ran a second copy of
+#: every loop). The process still serves queries and ingests.
+BACKGROUND_WORKERS_ENV = "TRELLION_BACKGROUND_WORKERS"
+
+
+def background_workers_enabled() -> bool:
+    """False only for an explicit 0/false/off/no; unset or anything else is on."""
+    raw = os.environ.get(BACKGROUND_WORKERS_ENV, "").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
 
 class PageIndexRAG:
     """Facade that initializes and wires all PageIndex + Graph components."""
@@ -130,6 +144,7 @@ class PageIndexRAG:
         self.persona_adapter: Optional[PersonaAdapter] = None
 
         self._started = False
+        self._background = False
 
     async def startup(self) -> None:
         """Initialize schema, connect store, create all components, start background workers."""
@@ -244,7 +259,34 @@ class PageIndexRAG:
             narrower_orchestrator=narrower_orchestrator,
         )
 
-        # 4. Start background workers
+        # 4. Start background workers, unless another process on the same
+        # database runs them (background_workers_enabled).
+        self._background = background_workers_enabled()
+        if not self._background:
+            log.info(
+                "pageindex_rag.background_workers_off",
+                reason=f"{BACKGROUND_WORKERS_ENV}=0: another process runs the backlog loops",
+            )
+        else:
+            await self._start_background_workers()
+
+        # No worker-pool start here. The host process owns its NATS worker
+        # pool (noomesh's worker_pool entrypoint starts it on its connected
+        # handle after this method returns). Calling the host's pool from a
+        # library inverted the dependency and, with this object's unset
+        # messaging handle, made every trellion start log a false
+        # `worker_pool.no_nats` warning (live controller, every start since 10-03).
+
+        self._started = True
+        log.info(
+            "pageindex_rag_started",
+            dsn=self.dsn[:30] + "...",
+            embedding_url=self.embedding_url,
+            llm_url=self.llm_url,
+        )
+
+    async def _start_background_workers(self) -> None:
+        """Start the backlog loops (embed, extract, graph, enrichment, metrics)."""
         await self.embedder.start()
         if self.extractor:
             await self.extractor.start()
@@ -272,21 +314,6 @@ class PageIndexRAG:
         # 6. Start the graph metrics provider (add-on)
         await self._start_signal_computer()
 
-        # No worker-pool start here. The host process owns its NATS worker
-        # pool (noomesh's worker_pool entrypoint starts it on its connected
-        # handle after this method returns). Calling the host's pool from a
-        # library inverted the dependency and, with this object's unset
-        # messaging handle, made every trellion start log a false
-        # `worker_pool.no_nats` warning (live controller, every start since 10-03).
-
-        self._started = True
-        log.info(
-            "pageindex_rag_started",
-            dsn=self.dsn[:30] + "...",
-            embedding_url=self.embedding_url,
-            llm_url=self.llm_url,
-        )
-
     async def _start_signal_computer(self) -> None:
         """Start the graph metrics provider, or skip quietly in the open tier."""
         signal_factory = _provider(GRAPH_METRICS)
@@ -310,13 +337,31 @@ class PageIndexRAG:
         """Stop background workers, close connections."""
         if not self._started:
             return
-
-        # Stop graph enrichment workers (reverse order: embedder, classifier)
+        # The clusterer is never started (heartbeat runs it on demand), but it
+        # holds a client either way.
         if self.clusterer:
             try:
                 await self.clusterer.close()
             except Exception:
                 log.warning("pageindex_rag.clusterer_close_failed", exc_info=True)
+        if self._background:
+            await self._stop_background_workers()
+        elif self.embedder:
+            # Queries opened its client even with the loops off.
+            await self.embedder.aclose()
+
+        if self.generator:
+            await self.generator.close()
+
+        # Close store connection
+        if self.store:
+            await self.store.close()
+
+        self._started = False
+        log.info("pageindex_rag_stopped")
+
+    async def _stop_background_workers(self) -> None:
+        # Stop graph enrichment workers (reverse order: embedder, classifier)
         if self.entity_embedder:
             try:
                 await self.entity_embedder.stop()
@@ -340,16 +385,6 @@ class PageIndexRAG:
             await self.extractor.stop()
         if self.embedder:
             await self.embedder.stop()
-
-        if self.generator:
-            await self.generator.close()
-
-        # Close store connection
-        if self.store:
-            await self.store.close()
-
-        self._started = False
-        log.info("pageindex_rag_stopped")
 
     async def ingest(
         self,
