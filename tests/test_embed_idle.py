@@ -15,7 +15,8 @@ import inspect
 
 from trellion.live import pageindex_embedder as pe_mod
 from trellion.live import pageindex_store
-from trellion.live.pageindex_embedder import IDLE_MAX_S, PageIndexEmbedder
+from trellion.live.embed_throttle import IDLE_MAX_S, EmbedThrottle
+from trellion.live.pageindex_embedder import PageIndexEmbedder
 
 
 def test_needs_embedding_is_not_exists_not_a_vector_carrying_join():
@@ -37,6 +38,7 @@ async def test_idle_wait_doubles_to_the_cap_and_a_wake_resets_it(monkeypatch):
     e = PageIndexEmbedder(_Idle(), embedding_url="https://gateway:8080")
     e._reembed = None
     monkeypatch.setattr(e.throttle, "startup_jitter_s", 0)
+    monkeypatch.setattr(e.throttle, "idle_max_s", 60.0)
 
     async def nothing(_batch_size):
         return 0
@@ -65,8 +67,8 @@ async def test_idle_wait_doubles_to_the_cap_and_a_wake_resets_it(monkeypatch):
 
     assert waits[:4] == [5.0, 10.0, 20.0, 40.0], waits
     assert waits[4] == 5.0, f"a wake must reset the back-off: {waits}"
-    assert max(waits) == IDLE_MAX_S, waits
-    assert all(w <= IDLE_MAX_S for w in waits)
+    assert max(waits) == 60.0, waits
+    assert all(w <= 60.0 for w in waits)
 
 
 async def test_a_long_idle_spell_never_overflows(monkeypatch):
@@ -97,3 +99,43 @@ async def test_a_long_idle_spell_never_overflows(monkeypatch):
     monkeypatch.setattr(pe_mod.asyncio, "wait_for", fake_wait_for)
     await real_wait_for(e._run_loop(5.0), 10)
     assert n["waits"] >= 2000
+
+
+async def test_a_new_document_waits_at_most_ten_seconds_by_default(monkeypatch):
+    """In the stack the doc-parsed wake never reaches the loop (ingest is in
+    trellion, the loop in trellion-intel), so the idle cap IS the delay before
+    a new document becomes citable: 60 s made it 37-40 s in the 0.6.13
+    rehearsal."""
+    monkeypatch.delenv("TRELLION_EMBED_IDLE_MAX_S", raising=False)
+    e = PageIndexEmbedder(_Idle(), embedding_url="https://gateway:8080", throttle=EmbedThrottle())
+    e._reembed = None
+    monkeypatch.setattr(e.throttle, "startup_jitter_s", 0)
+
+    async def nothing(_batch_size):
+        return 0
+
+    monkeypatch.setattr(e, "process_unembedded_pages", nothing)
+    monkeypatch.setattr(e, "process_unembedded_chunks", nothing)
+    waits: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def fake_wait_for(aw, timeout=None):
+        if timeout is None:
+            return await real_wait_for(aw, timeout)
+        if inspect.iscoroutine(aw):
+            aw.close()
+        waits.append(timeout)
+        if len(waits) >= 8:
+            e._stop_requested = True
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(pe_mod.asyncio, "wait_for", fake_wait_for)
+    await real_wait_for(e._run_loop(5.0), 5)
+    assert IDLE_MAX_S == 10.0
+    assert waits == [5.0] + [10.0] * 7, waits
+
+
+def test_the_idle_cap_is_tunable(monkeypatch):
+    monkeypatch.setenv("TRELLION_EMBED_IDLE_MAX_S", "30")
+    assert EmbedThrottle().idle_max_s == 30.0
+    assert EmbedThrottle(idle_max_s=2.0).idle_max_s == 2.0
