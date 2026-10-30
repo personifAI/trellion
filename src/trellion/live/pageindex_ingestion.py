@@ -970,7 +970,10 @@ class DocumentIngestor:
         page_count: int,
         source_uri: str,
     ) -> None:
-        """Publish ``ingest.doc.parsed`` NATS event if messaging is available."""
+        """Wake the embedder (Postgres NOTIFY), then publish ``ingest.doc.parsed`` if messaging is set."""
+        from .doc_wake import notify_doc_parsed
+
+        await notify_doc_parsed(getattr(self.store, "_engine", None), doc_id)
         if self.messaging is None:
             return
         try:

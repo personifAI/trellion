@@ -52,6 +52,16 @@ log = structlog.get_logger(__name__)
 
 RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 
+# Default longest wait between idle backlog polls (TRELLION_EMBED_IDLE_MAX_S).
+# It is also the most a newly ingested document waits if its wake is missed:
+# ingest NOTIFYs Postgres (live/doc_wake.py) and the embedder LISTENs, so the
+# wake crosses containers through the shared database; this cap is the
+# fallback. (Before that, the wake only reached a loop in the ingesting
+# process and 60 s made the first citation of a console upload take 37-40 s,
+# 0.6.13 rehearsal.) The idle poll is two NOT EXISTS index probes, so 10 s
+# costs nothing that matters.
+IDLE_MAX_S = 10.0
+
 
 def _env_num(name: str, default: float) -> float:
     try:
@@ -128,6 +138,7 @@ class EmbedThrottle:
         backoff_cap_s: float | None = None,
         pace_s: float | None = None,
         startup_jitter_s: float | None = None,
+        idle_max_s: float | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rng: random.Random | None = None,
     ) -> None:
@@ -143,6 +154,7 @@ class EmbedThrottle:
         self.backoff_cap_s = pick(backoff_cap_s, "TRELLION_EMBED_BACKOFF_CAP_S", 60.0)
         self.pace_s = pick(pace_s, "TRELLION_EMBED_PACE_S", 0.5)
         self.startup_jitter_s = pick(startup_jitter_s, "TRELLION_EMBED_STARTUP_JITTER_S", 30.0)
+        self.idle_max_s = pick(idle_max_s, "TRELLION_EMBED_IDLE_MAX_S", IDLE_MAX_S)
         self._sleep = sleep
         self._rng = rng or random.Random()
         self._sem: asyncio.Semaphore | None = None
