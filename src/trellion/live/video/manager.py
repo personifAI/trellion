@@ -243,8 +243,11 @@ class VideoMemoryManager:
         query: str,
         top_k: int = 5,
         persona_id: Optional[str] = None,
+        *,
+        org: str,
     ) -> list[SearchResult]:
-        """Search the traversals FAISS index — proven past graph walks."""
+        """Search the traversals index — proven past graph walks — in the
+        caller's ``org`` only (i434: there is no any-org form)."""
         if not self._started or not self._ensure_engine():
             return []
 
@@ -256,6 +259,7 @@ class VideoMemoryManager:
             persona_id=persona_id or "default",
             query_embedding=embedding,
             k=top_k,
+            org=org,
         )
         return [
             SearchResult(
@@ -290,8 +294,10 @@ class VideoMemoryManager:
         query: str,
         top_k: int = 5,
         persona_id: Optional[str] = None,
+        *,
+        org: str,
     ) -> list[Any]:
-        return await self.search_traversals(query, top_k=top_k, persona_id=persona_id)
+        return await self.search_traversals(query, top_k=top_k, persona_id=persona_id, org=org)
 
     # ------------------------------------------------------------------
     # Capture (write side)

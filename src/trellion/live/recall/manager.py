@@ -80,9 +80,11 @@ class EpisodicRecallManager:
         *,
         intent: str | None = None,
         top_k: int = 10,
+        org: str,
     ) -> list[ReplayMatch]:
+        """Past traversals like this query, in the caller's ``org`` only."""
         return await self.replay.find_similar(
-            persona_id, query_embedding, intent=intent, k=top_k
+            persona_id, query_embedding, intent=intent, k=top_k, org=org
         )
 
     # ------------------------------------------------------------------
