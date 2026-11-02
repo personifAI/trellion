@@ -88,6 +88,7 @@ class TraversalArchiver:
                 exploration_rate=snapshot.exploration_rate,
                 uncertainty_fingerprint=snapshot.uncertainty_fingerprint,
                 user_id=getattr(snapshot, "user_id", None),
+                org_id=getattr(snapshot, "org_id", None),
                 kind=getattr(snapshot, "kind", None) or "simulated",
                 thread_id=getattr(snapshot, "thread_id", None),
                 turn_index=getattr(snapshot, "turn_index", None),
