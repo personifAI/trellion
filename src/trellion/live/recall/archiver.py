@@ -30,6 +30,11 @@ from trellion import embedding_space
 
 logger = structlog.get_logger(__name__)
 
+#: The org a traversal is stamped with when its caller names none: the mesh's
+#: default org (gateway ``repo::users::DEFAULT_ORG_ID``), which is also what
+#: trellion's model means by a NULL ``org_id``.
+DEFAULT_ORG = "default"
+
 DEFAULT_MIN_OUTCOME = 0.6
 
 #: ``thread`` = a user's real, attributed walk; ``simulated`` = a walk the
@@ -73,6 +78,7 @@ class TraversalArchiver:
         usefulness: float | None = None,
         expires_at: datetime | None = None,
         embedding_model: str | None = None,
+        org_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Archive a traversal if it meets the outcome threshold.
 
@@ -105,6 +111,12 @@ class TraversalArchiver:
 
         ``user_id`` is also written onto the ``trellion_episodes`` row so
         erasure reaches the question text and embedding held there.
+
+        ``org_id`` is the tenant the walk belongs to, and every row is stamped
+        with one (noomesh-internal i434): replay reads only the caller's org, and
+        an unstamped row is in no one's. The caller passes the asker's org;
+        omitted, it is ``DEFAULT_ORG``, the same org the mesh gives a
+        conversation with no user (trellion's model: NULL = 'default').
 
         Returns:
             ``{archived: True, traversal_id, frame_id}`` on success,
@@ -194,6 +206,7 @@ class TraversalArchiver:
                     "uncertainty": json.dumps(uncertainty_fingerprint or {}),
                     "frame_id": frame_id,
                     "user_id": user_id or None,
+                    "org_id": (org_id or "").strip() or DEFAULT_ORG,
                     "kind": kind,
                     "thread_id": thread_uuid,
                     "turn_index": turn_index,
@@ -215,7 +228,7 @@ class TraversalArchiver:
                         " uncertainty_fingerprint, archived_to_video, video_frame_id, "
                         " user_id, kind, thread_id, turn_index, run_id, provenance, "
                         " evidence, usefulness, expires_at, embedding_model, "
-                        " embedding_dim, last_validated_at) "
+                        " embedding_dim, last_validated_at, org_id) "
                         "VALUES (CAST(:id AS uuid), :persona, :query, "
                         f"        {emb_sql}, "
                         "        :intent, "
@@ -224,7 +237,7 @@ class TraversalArchiver:
                         "        CAST(:frame_id AS uuid), :user_id, :kind, "
                         "        CAST(:thread_id AS uuid), :turn_index, :run_id, "
                         "        CAST(:provenance AS jsonb), CAST(:evidence AS jsonb), "
-                        "        :usefulness, :expires_at, :emb_model, :emb_dim, NOW())"
+                        "        :usefulness, :expires_at, :emb_model, :emb_dim, NOW(), :org_id)"
                     ),
                     params,
                 )
