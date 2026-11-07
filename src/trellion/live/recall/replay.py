@@ -60,7 +60,7 @@ class TraversalReplayEngine:
         *,
         intent: str | None = None,
         k: int = 10,
-        org: str | None = None,
+        org: str,
     ) -> list[ReplayMatch]:
         """Return up to k past traversals ranked by combined score.
 
@@ -70,9 +70,12 @@ class TraversalReplayEngine:
 
         ``org`` bounds the hydrated records to that tenant (PR5b-3): the
         vector search returns candidate frame_ids, but the Postgres row
-        fetch drops any that aren't in the caller's org. ``None`` =
-        single-org (no filter).
+        fetch drops any that aren't in the caller's org. It is REQUIRED and
+        there is no "any org" form (noomesh-internal i434): a row reads only in
+        the org it was stamped with, and an unstamped row in no org at all.
         """
+        if not org or not org.strip():
+            raise ValueError("find_similar needs the caller's org (there is no any-org replay)")
         try:
             hits = await PersonaVectorIndex(self._engine, persona_id).search(
                 index_name="traversals",
@@ -99,8 +102,9 @@ class TraversalReplayEngine:
                     "WHERE tr.persona_id = :p "
                     "  AND tr.video_frame_id::text = ANY(:fids) "
                     "  AND tr.outcome_score >= :min_out "
-                    # PR5b-3 org boundary: NULL org param = single-org (no filter).
-                    "  AND (:org::text IS NULL OR tr.org_id = :org)"
+                    # PR5b-3 org boundary, strict (i434): the caller's org only;
+                    # an unstamped (NULL) row is in no one's org.
+                    "  AND tr.org_id = :org"
                 ),
                 {"p": persona_id, "fids": frame_ids, "min_out": MIN_OUTCOME_SCORE, "org": org},
             )).fetchall()

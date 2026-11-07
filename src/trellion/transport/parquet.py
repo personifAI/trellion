@@ -231,8 +231,13 @@ class ParquetShardPackager:
         tarball_path: Path | str,
         *,
         verify_hashes: bool = True,
+        org_id: str = "default",
     ) -> ShardManifest:
         """Extract a shard tarball and write its rows into the live DB.
+
+        A shard carries no org, so its traversals are stamped with ``org_id``
+        (the importing org; default ``"default"``). An unstamped traversal
+        would be in no one's org (noomesh-internal i434).
 
         Idempotent: rows are inserted with ``ON CONFLICT DO NOTHING`` so
         re-applying the same shard is a no-op. FAISS sidecar is unpacked
@@ -277,7 +282,7 @@ class ParquetShardPackager:
                 elif table_name == FRAMES_TABLE:
                     await self._apply_frames(rows)
                 elif table_name == TRAVERSALS_TABLE:
-                    await self._apply_traversals(rows)
+                    await self._apply_traversals(rows, org_id)
                 else:
                     logger.warning("shard.unknown_table_skipped", name=table_name)
 
@@ -494,7 +499,7 @@ class ParquetShardPackager:
                     },
                 )
 
-    async def _apply_traversals(self, rows: list[dict[str, Any]]) -> None:
+    async def _apply_traversals(self, rows: list[dict[str, Any]], org_id: str = "default") -> None:
         async with self._engine.begin() as conn:
             for r in rows:
                 await conn.execute(
@@ -504,7 +509,7 @@ class ParquetShardPackager:
                         " embedding_model, embedding_dim, intent, "
                         " traversal_path, outcome_score, exploration_rate, "
                         " uncertainty_fingerprint, archived_to_video, video_frame_id, "
-                        " created_at, updated_at) "
+                        " created_at, updated_at, org_id) "
                         "VALUES (CAST(:id AS uuid), :p, :q, "
                         "        CASE WHEN :emb IS NULL THEN NULL::vector ELSE CAST(:emb AS vector) END, "
                         # The model travels with the shard (a shard from an older
@@ -517,7 +522,7 @@ class ParquetShardPackager:
                         "        CAST(:path AS jsonb), :outcome, :rate, "
                         "        CAST(:uf AS jsonb), :archived, "
                         "        CASE WHEN :fid IS NULL THEN NULL::uuid ELSE CAST(:fid AS uuid) END, "
-                        "        :created, :updated) "
+                        "        :created, :updated, :org) "
                         "ON CONFLICT (id) DO NOTHING"
                     ),
                     {
@@ -530,6 +535,7 @@ class ParquetShardPackager:
                         "uf": r.get("uncertainty_fingerprint_json") or "{}",
                         "archived": r["archived_to_video"], "fid": r.get("video_frame_id"),
                         "created": r["created_at"], "updated": r["updated_at"],
+                        "org": (org_id or "").strip() or "default",
                     },
                 )
 
