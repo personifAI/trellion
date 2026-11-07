@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
+from psycopg.conninfo import conninfo_to_dict
 from sqlalchemy.engine import make_url
 
 from trellion.live import doc_wake
@@ -142,7 +143,14 @@ async def test_notification_wakes_a_waiting_loop_well_before_the_idle_timeout(mo
         await _until(lambda: len(passes) >= 1 and bus.conns and bus.conns[0].listened)
         assert bus.conns[0].listened == [f"LISTEN {doc_wake.CHANNEL}"]
         # the DSN is the store's database, password included, driver stripped
-        assert bus.conninfos[0].startswith("postgresql://u:p@db:5432/noomesh")
+        assert conninfo_to_dict(bus.conninfos[0]) == {
+            "host": "db",
+            "port": "5432",
+            "dbname": "noomesh",
+            "user": "u",
+            "password": "p",
+            "sslmode": "verify-full",
+        }
         n = len(passes)
         bus.conns[0].notify("doc-42")
         await _until(lambda: len(passes) > n, timeout=1.0)  # idle wait is 30 s
@@ -228,3 +236,40 @@ async def test_unreachable_database_backs_off_instead_of_spinning():
     await asyncio.sleep(0.4)
     await lst.stop()
     assert 2 <= len(attempts) <= 6, attempts
+
+
+class _UrlOnly:
+    def __init__(self, url):
+        self.url = make_url(url)
+
+
+def test_a_search_path_option_reaches_postgres_with_its_space():
+    """noomesh i545 63: the rendered URL turned ``-c search_path`` into
+    ``-c+search_path`` and Postgres refused the LISTEN connection."""
+    engine = _UrlOnly(
+        "postgresql+asyncpg://u:p%40ss@db:5432/trellion"
+        "?options=-c%20search_path%3Dtrellion,public&sslmode=require"
+    )
+    assert conninfo_to_dict(doc_wake.conninfo_from_engine(engine)) == {
+        "host": "db",
+        "port": "5432",
+        "dbname": "trellion",
+        "user": "u",
+        "password": "p@ss",
+        "options": "-c search_path=trellion,public",
+        "sslmode": "require",
+    }
+
+
+def test_a_socket_url_names_no_empty_host():
+    engine = _UrlOnly("postgresql+psycopg://u@/trellion?host=/run/postgresql")
+    assert conninfo_to_dict(doc_wake.conninfo_from_engine(engine)) == {
+        "host": "/run/postgresql",
+        "dbname": "trellion",
+        "user": "u",
+    }
+
+
+def test_a_key_given_twice_keeps_its_last_value():
+    engine = _UrlOnly("postgresql://u@db/trellion?sslmode=disable&sslmode=verify-full")
+    assert conninfo_to_dict(doc_wake.conninfo_from_engine(engine))["sslmode"] == "verify-full"
