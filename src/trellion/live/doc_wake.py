@@ -45,8 +45,29 @@ async def notify_doc_parsed(engine: Any, doc_id: str) -> None:
 
 
 def conninfo_from_engine(engine: Any) -> str:
-    """A libpq URL (with password) for the engine's database."""
-    return engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
+    """A libpq ``key=value`` conninfo (with password) for the engine's database.
+
+    Built from the URL's decoded parts, never by rendering the URL: SQLAlchemy
+    renders a query value with ``quote_plus``, so ``options=-c search_path=x``
+    becomes ``-c+search_path=x``. libpq does not read ``+`` as a space, and
+    Postgres refused every LISTEN connection with
+    ``FATAL: unrecognized configuration parameter "+search_path"`` (noomesh
+    i545 63). A key given twice keeps its last value, as libpq would; an
+    absent part (no host for a socket URL) is left out by ``make_conninfo``.
+    """
+    from psycopg.conninfo import make_conninfo
+
+    url = engine.url
+    params: dict[str, Any] = {
+        "host": url.host,
+        "port": url.port,
+        "dbname": url.database,
+        "user": url.username,
+        "password": url.password,
+    }
+    for key, value in url.query.items():
+        params[key] = value[-1] if isinstance(value, tuple) else value
+    return make_conninfo(**params)
 
 
 async def _psycopg_connect(conninfo: str) -> Any:
