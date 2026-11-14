@@ -344,14 +344,24 @@ def exact_sql() -> str:
     filter. Same filter, in the same statement."""
     from trellion_protocols.schema import ROLES_WHERE
 
+    # Driven FROM the visible set: the readable chunks are materialised first
+    # (docs -> pages -> chunks, the audience filter in this statement), then
+    # their embeddings are fetched by primary key. The first share run joined
+    # the other way round and computed all 300k distances whatever the share
+    # (~3.3 s flat): the planner cannot estimate the JSONB audience predicate.
     return f"""
-        SELECT c.chunk_id, c.page_id, c.chunk_no, c.text,
+        WITH vis AS MATERIALIZED (
+            SELECT c.chunk_id, c.page_id, c.chunk_no, c.text
+            FROM docs d
+            JOIN pages p ON p.doc_id = d.doc_id
+            JOIN page_chunks c ON c.page_id = p.page_id
+            WHERE d.held_at IS NULL AND {ROLES_WHERE}
+        )
+        SELECT v.chunk_id, v.page_id, v.chunk_no, v.text,
                ce.embedding <=> CAST(:vec AS vector) AS distance
-        FROM chunk_embeddings ce
-        JOIN page_chunks c ON c.chunk_id = ce.chunk_id
-        JOIN pages p ON p.page_id = c.page_id
-        JOIN docs d ON d.doc_id = p.doc_id
-        WHERE d.held_at IS NULL AND {ROLES_WHERE} AND ce.embedding_model = :emb_model
+        FROM vis v
+        JOIN chunk_embeddings ce ON ce.chunk_id = v.chunk_id
+        WHERE ce.embedding_model = :emb_model
         ORDER BY (ce.embedding <=> CAST(:vec AS vector)) + 0
         LIMIT :top_k"""
 
@@ -373,7 +383,11 @@ async def measure_share(dsn: str, w: dict, queries: list[dict], container: str) 
         vis = visible(w, roles)
         for path in ("relaxed HNSW (search_chunks)", "exact over the visible set"):
             restart_cold(container)
-            opts = f"-csearch_path={TRELLION_SCHEMA},public" + (" -c hnsw.iterative_scan=relaxed_order" if path.startswith("relaxed") else "")
+            # The exact path joins by primary key (nested loops): what a
+            # production version would set with SET LOCAL for this statement.
+            opts = f"-csearch_path={TRELLION_SCHEMA},public" + (
+                " -c hnsw.iterative_scan=relaxed_order" if path.startswith("relaxed")
+                else " -c enable_hashjoin=off -c enable_mergejoin=off")
             eng = create_async_engine(_async_dsn(dsn), connect_args={"options": opts})
             store = PageIndexStore(async_engine=eng, embedding_dim=DIM)
             passes, results = [], []
