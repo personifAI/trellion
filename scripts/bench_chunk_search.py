@@ -144,8 +144,12 @@ async def seed(dsn: str, w: dict) -> None:
                 for k in range(i, min(i + step, len(w["chunk_ids"])))])
         print(f"bench: seeded in {time.time() - now:.0f}s", flush=True)
         t = time.time()
-        await conn.execute("SET maintenance_work_mem = '2GB'")
-        await conn.execute("SET max_parallel_maintenance_workers = 3")
+        # A parallel HNSW build allocates maintenance_work_mem in dynamic shared
+        # memory, which the stack caps at shm_size 1g: 2GB failed with "could not
+        # resize shared memory segment". Stay under it; the build is slower, and
+        # it is setup, not measured.
+        await conn.execute("SET maintenance_work_mem = '800MB'")
+        await conn.execute("SET max_parallel_maintenance_workers = 2")
         for r in idx:
             await conn.execute(r["indexdef"])
         print(f"bench: HNSW index(es) rebuilt in {time.time() - t:.0f}s: {[r['indexname'] for r in idx]}", flush=True)
