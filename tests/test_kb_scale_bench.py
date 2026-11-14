@@ -38,7 +38,7 @@ def test_the_workflow_only_ever_talks_to_its_own_container():
 
 @pytest.mark.parametrize("dsn", [
     "postgresql+asyncpg://noo:x@pop-os:5432/noomesh",
-    "postgresql+asyncpg://noo:x@100.64.0.7:5432/noomesh",
+    "postgresql+asyncpg://noo:x@203.0.113.7:5432/noomesh",
     "postgresql+asyncpg://noo:x@noo-postgres:5432/noomesh",
 ])
 def test_the_script_refuses_any_database_but_localhost(dsn):
