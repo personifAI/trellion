@@ -77,6 +77,12 @@ def build_world(n_chunks: int, n_pages: int, n_docs: int, seed: int) -> dict:
     edges = np.cumsum([w for _, w in AUDIENCES])
     doc_aud = np.searchsorted(edges, roll)
     doc_held = rng.random(n_docs) < 0.01
+    # Every audience gets at least two readable (not held) documents, so a
+    # small run still has restricted chunks to aim the probes at.
+    for k in range(len(AUDIENCES)):
+        have = np.flatnonzero((doc_aud == k) & ~doc_held)
+        for d in rng.choice(n_docs, max(0, 2 - len(have)), replace=False):
+            doc_aud[d], doc_held[d] = k, False
     page_doc = np.sort(rng.integers(0, n_docs, n_pages))
     chunk_page = np.sort(rng.integers(0, n_pages, n_chunks))
     chunk_doc = page_doc[chunk_page]
