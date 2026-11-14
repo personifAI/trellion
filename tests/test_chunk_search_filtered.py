@@ -83,11 +83,16 @@ async def test_a_restricted_chunk_is_never_returned_even_when_it_is_the_nearest(
     restricted = await make("finance", ["finance"], [_vec(1.0, jitter=0.001, rng=rng) for _ in range(6)])
     public = await make("public", None, [_vec(0.8, 0.6, jitter=0.001, rng=rng) for _ in range(6)])
     q = _vec(1.0)
-    got = {c["chunk_id"] for c in await store.search_chunks(q, top_k=5, roles=["user"])}
-    assert not got & set(restricted), "a finance chunk reached a caller without the finance role"
-    assert got and got <= set(public), got
-    allowed = {c["chunk_id"] for c in await store.search_chunks(q, top_k=5, roles=["user", "finance"])}
-    assert allowed and allowed <= set(restricted), "the finance role sees the nearest (finance) chunks"
+    # Both global paths, each forced: the HNSW walk and the exact search over
+    # the visible set. Each must hold the audience filter on its own.
+    for path, limit in (("hnsw", -1), ("exact", 10**9)):
+        store.EXACT_VISIBLE_MAX_CHUNKS = limit
+        store._visible_counts.clear()
+        got = {c["chunk_id"] for c in await store.search_chunks(q, top_k=5, roles=["user"])}
+        assert not got & set(restricted), f"{path}: a finance chunk reached a caller without the finance role"
+        assert got and got <= set(public), (path, got)
+        allowed = {c["chunk_id"] for c in await store.search_chunks(q, top_k=5, roles=["user", "finance"])}
+        assert allowed and allowed <= set(restricted), f"{path}: the finance role sees the nearest (finance) chunks"
 
 
 @needs_db
@@ -108,6 +113,7 @@ async def test_a_narrow_audience_still_gets_top_k_when_the_nearest_chunks_are_no
         if "chunk_embeddings" in statement and "ORDER BY" in statement:
             seen[:] = [(statement, params)]
 
+    store.EXACT_VISIBLE_MAX_CHUNKS = -1  # this test is about the HNSW walk
     got = await store.search_chunks(q, top_k=5, roles=["finance"])
 
     # The HNSW index drives THIS statement's plan (the shape at scale), so the
@@ -122,3 +128,66 @@ async def test_a_narrow_audience_still_gets_top_k_when_the_nearest_chunks_are_no
     assert set(ids) <= set(finance)
     scores = [c["score"] for c in got]
     assert scores == sorted(scores, reverse=True), "results are re-sorted by distance"
+
+
+def _paths(eng) -> list[str]:
+    """Which global path each chunk search took, from the statements sent."""
+    from sqlalchemy import event
+
+    taken: list[str] = []
+
+    @event.listens_for(eng.sync_engine, "before_cursor_execute")
+    def grab(conn, cursor, statement, params, context, executemany):  # noqa: ANN001
+        if "WITH vis AS MATERIALIZED" in statement:
+            taken.append("exact")
+        elif "WITH ranked AS MATERIALIZED" in statement:
+            taken.append("hnsw")
+
+    return taken
+
+
+@needs_db
+async def test_a_narrow_audience_takes_the_exact_path_and_a_broad_one_the_index(world):
+    store, make, eng = world
+    rng = random.Random(787)
+    finance = await make("finance", ["finance"], [_vec(0.8, 0.6, jitter=0.01, rng=rng) for _ in range(6)])
+    await make("public", None, [_vec(1.0, jitter=0.01, rng=rng) for _ in range(30)])
+    q = _vec(1.0)
+    # Between the narrow audience's count (6) and the broad one's (30+): the
+    # count must apply the audience filter for the narrow set to fall under it.
+    store.EXACT_VISIBLE_MAX_CHUNKS = 10
+    taken = _paths(eng)
+    narrow = await store.search_chunks(q, top_k=5, roles=["finance"])
+    assert taken == ["exact"], f"6 visible chunks should take the exact path: {taken}"
+    assert {c["chunk_id"] for c in narrow} <= set(finance) and len(narrow) == 5
+    assert [c["score"] for c in narrow] == sorted((c["score"] for c in narrow), reverse=True)
+    await store.search_chunks(q, top_k=5, roles=["user"])
+    assert taken == ["exact", "hnsw"], f"30+ visible chunks should take the index: {taken}"
+
+
+@needs_db
+async def test_the_visible_count_is_cached_per_full_roles_set_never_across_sets(world):
+    store, make, eng = world
+    rng = random.Random(788)
+    await make("finance", ["finance"], [_vec(0.8, 0.6, jitter=0.01, rng=rng) for _ in range(6)])
+    await make("public", None, [_vec(1.0, jitter=0.01, rng=rng) for _ in range(30)])
+    q = _vec(1.0)
+    store.EXACT_VISIBLE_MAX_CHUNKS = 10
+    store._visible_counts.clear()
+    taken = _paths(eng)
+    await store.search_chunks(q, top_k=5, roles=["finance"])
+    # Another roles set within the TTL must count for itself: reusing the
+    # narrow set's 6 would send a broad audience down the exact path.
+    await store.search_chunks(q, top_k=5, roles=["user", "finance"])
+    assert taken == ["exact", "hnsw"], taken
+    keys = list(store._visible_counts)
+    assert len(keys) == 2 and {k[0] for k in keys} == {("finance",), ("finance", "user")}, keys
+
+
+def test_the_cache_key_is_the_sorted_full_roles_set_and_the_model():
+    from trellion.live.pageindex_store import PageIndexStore
+
+    k = PageIndexStore._visible_key
+    assert k(["user", "finance", "user"], {}) == k(["finance", "user"], {}), "order and repeats do not matter"
+    assert k(["finance"], {}) != k(["finance", "user"], {}), "a different set is a different key"
+    assert k(["finance"], {"emb_model": "a"}) != k(["finance"], {"emb_model": "b"}), "and so is another model"
