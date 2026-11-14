@@ -264,11 +264,14 @@ async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: st
             store_fb = PageIndexStore(async_engine=eng_fb, embedding_dim=DIM) if eng_fb else None
             fell_back = 0
             seen_sql: list = []
+            paths_taken: set = set()
 
             @event.listens_for(eng.sync_engine, "before_cursor_execute")
             def grab(conn, cursor, statement, params, context, executemany):  # noqa: ANN001
                 if "chunk_embeddings" in statement and "ORDER BY" in statement:
                     seen_sql[:] = [(statement, params)]
+                    # Which global path search_chunks took (trellion >= i785 step 2).
+                    paths_taken.add("exact" if "WITH vis AS MATERIALIZED" in statement else "hnsw")
 
             store = PageIndexStore(async_engine=eng, embedding_dim=DIM)
             passes = []
@@ -325,6 +328,7 @@ async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: st
                 "min_recall": round(float(np.min(recalls)) if recalls else float("nan"), 3),
                 "strict_recall": round(float(np.mean(strict)) if strict else float("nan"), 3),
                 "fell_back": fell_back if fallback is not None else None,
+                "path": "+".join(sorted(paths_taken)) or "?",
                 "underfill": under, "leaks": leaks, "plan_text": plan_txt,
             })
             print(json.dumps({k2: v for k2, v in rows[-1].items() if k2 != "plan_text"}), flush=True)
@@ -381,21 +385,26 @@ async def measure_share(dsn: str, w: dict, queries: list[dict], container: str) 
     for aud, share in SHARE_AUDIENCES[1:]:
         roles = aud
         vis = visible(w, roles)
-        for path in ("relaxed HNSW (search_chunks)", "exact over the visible set"):
+        paths = ["relaxed HNSW (search_chunks)", "exact over the visible set"]
+        if hasattr(PageIndexStore, "EXACT_VISIBLE_MAX_CHUNKS"):
+            paths.append("search_chunks (auto)")  # what the shipped threshold picks
+        for path in paths:
             restart_cold(container)
             # The exact path joins by primary key (nested loops): what a
             # production version would set with SET LOCAL for this statement.
             opts = f"-csearch_path={TRELLION_SCHEMA},public" + (
                 " -c hnsw.iterative_scan=relaxed_order" if path.startswith("relaxed")
-                else " -c enable_hashjoin=off -c enable_mergejoin=off")
+                else " -c enable_hashjoin=off -c enable_mergejoin=off" if path.startswith("exact") else "")
             eng = create_async_engine(_async_dsn(dsn), connect_args={"options": opts})
             store = PageIndexStore(async_engine=eng, embedding_dim=DIM)
+            if path.startswith("relaxed") and hasattr(store, "EXACT_VISIBLE_MAX_CHUNKS"):
+                store.EXACT_VISIBLE_MAX_CHUNKS = -1  # the HNSW row is the HNSW path, whatever the threshold
             passes, results = [], []
             for p in range(3):
                 lat = []
                 for q in queries:
                     t = time.perf_counter()
-                    if path.startswith("relaxed"):
+                    if not path.startswith("exact"):
                         got = [g["chunk_id"] for g in await store.search_chunks(Vec(q["vec"].tolist()), top_k=k, roles=roles)]
                     else:
                         async with eng.connect() as c:
@@ -441,10 +450,10 @@ def report_share(rows: list[dict], n: int, nq: int) -> str:
 
 def report(rows: list[dict], n: int, nq: int) -> str:
     out = [f"### search_chunks at {n:,} seeded chunks ({nq} queries per cell; recall vs exact numpy)", "",
-           "| setting | shape | k | chunk_embeddings access | cold first ms | cold p50/p95 ms | warm p50/p95 ms | recall@k tie-aware (min) | strict recall | fell back | underfill | audience leaks |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+           "| setting | shape | k | path | chunk_embeddings access | cold first ms | cold p50/p95 ms | warm p50/p95 ms | recall@k tie-aware (min) | strict recall | fell back | underfill | audience leaks |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
-        out.append(f"| {r['setting']} | {r['shape']} | {r['k']} | `{r['plan'][:80]}` | {r['cold_first_ms']} | "
+        out.append(f"| {r['setting']} | {r['shape']} | {r['k']} | {r.get('path', '?')} | `{r['plan'][:80]}` | {r['cold_first_ms']} | "
                    f"{r['cold_p50']} / {r['cold_p95']} | {r['warm_p50']} / {r['warm_p95']} | {r['recall']} ({r['min_recall']}) | "
                    f"{r['strict_recall']} | {'-' if r['fell_back'] is None else r['fell_back']} | {r['underfill']} | {r['leaks']} |")
     return "\n".join(out) + "\n"
