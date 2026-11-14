@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# search_chunks at knowledge-base scale, on SEEDED data (noomesh-internal i785:
+# the `kb_chunk_scale` alert fired at ~285k chunks). Dispatch only: it is a
+# measurement, not a gate, and it takes about an hour.
+#
+# It never touches a real database. Postgres is a throw-away container of the
+# stack's own image (pgvector 0.8.2 in 0.6.24), sized as the stack sizes it
+# (docker-compose.cluster.yml: shared_buffers 512MB, work_mem 32MB,
+# maintenance_work_mem 256MB, effective_cache_size 2GB, shm 1g), migrated by
+# trellion's own alembic chain, and seeded by scripts/bench_chunk_search.py,
+# which refuses any non-localhost DSN and any database that already has docs.
+#
+#   gh workflow run kb-scale-bench.yml -R personifAI/trellion --ref <branch>
+name: kb scale bench (dispatch only)
+on:
+  workflow_dispatch:
+    inputs:
+      chunks:
+        description: 'chunk embeddings to seed'
+        default: '300000'
+      queries:
+        description: 'query vectors per cell'
+        default: '50'
+      mode:
+        description: 'settings (iterative-scan settings per shape) or share (exact vs relaxed by visible share)'
+        default: 'settings'
+      image:
+        description: "the stack's postgres image"
+        default: 'ghcr.io/noomesh/postgres-pgvector:v0.6.24-rc.7'
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: The trellion-protocols pin is reachable
+        run: bash scripts/check-protocols-access.sh
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install asyncpg alembic numpy pgvector
+      - name: Throw-away postgres (the stack's image and sizing)
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -eu
+          docker run -d --name bench-pg --shm-size 1g \
+            -e POSTGRES_USER=noo -e POSTGRES_PASSWORD=benchpw -e POSTGRES_DB=noomesh \
+            -p 127.0.0.1:5432:5432 "$IMAGE" \
+            -c work_mem=32MB -c shared_buffers=512MB -c maintenance_work_mem=256MB -c effective_cache_size=2GB
+          for i in $(seq 1 60); do docker exec bench-pg pg_isready -U noo && break; sleep 2; done
+          docker exec bench-pg psql -U noo -d noomesh -tAc "SELECT extversion FROM pg_available_extensions WHERE name='vector'" \
+            | sed 's/^/pgvector available: /'
+      - name: Extensions and trellion's migrations
+        env:
+          PGPASSWORD: benchpw
+          DATABASE_URL: postgresql://noo:benchpw@localhost:5432/noomesh
+        run: |
+          set -eu
+          psql -h localhost -U noo -d noomesh -c "CREATE EXTENSION IF NOT EXISTS vector" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+          alembic -c src/trellion/db/alembic.ini upgrade heads
+      - name: Seed and measure
+        env:
+          CHUNKS: ${{ inputs.chunks }}
+          QUERIES: ${{ inputs.queries }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          python scripts/bench_chunk_search.py \
+            --dsn postgresql+asyncpg://noo:benchpw@localhost:5432/noomesh \
+            --container bench-pg --chunks "$CHUNKS" --queries "$QUERIES" --mode "$MODE" --out bench-out
+      - name: Results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: kb-scale-bench
+          path: bench-out/
+          if-no-files-found: warn

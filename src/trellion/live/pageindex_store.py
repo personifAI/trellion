@@ -16,6 +16,7 @@ from __future__ import annotations
 from .. import json_fast as json
 import asyncio
 import os
+import time
 import uuid
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
@@ -134,6 +135,9 @@ class PageIndexStore:
         # per id column: concurrent batches here must not pick the same rows
         # now that the pick holds no lock across the embed.
         self._inflight: dict[str, set[str]] = {}
+        # Visible chunk counts per (roles set, embedding model), for the global
+        # chunk search's path choice; see EXACT_VISIBLE_MAX_CHUNKS.
+        self._visible_counts: dict[tuple, tuple[int, float]] = {}
         self._pick_lock = asyncio.Lock()
 
     # -- the add-on contract (trellion_protocols.GraphStore) -------------
@@ -868,6 +872,50 @@ class PageIndexStore:
     # not searched, not counted. `d` is the docs row.
     _NOT_HELD = "d.held_at IS NULL"
 
+    # Global chunk search for a NARROW audience: an exact search over the
+    # chunks the caller can read beats the HNSW walk, whose cold cost grows as
+    # the audience narrows. Measured on a seeded 300k corpus (noomesh-internal
+    # i785, run 43562235996): the exact path costs ~45 µs per VISIBLE chunk,
+    # cold and warm alike, and at <= ~4,000 visible chunks it is never worse than
+    # relaxed HNSW (1%: cold p95 5.4 s -> 0.15 s, warm 159 vs 168 ms, recall
+    # 0.79 -> 1.0); from ~4k to ~30k it trades a better cold tail for a worse
+    # warm time, and above that HNSW wins both. So the threshold is a chunk
+    # COUNT (the never-worse point), not a share of the corpus. Raising it to
+    # ~10k favours cold over warm: an operator option recorded in i785.
+    EXACT_VISIBLE_MAX_CHUNKS = 4000
+    # How long a visible count is reused for the same roles set and model. A
+    # stale count can only choose the slower path: both paths apply every
+    # filter in their own statement.
+    VISIBLE_COUNT_TTL_S = 60.0
+
+    @staticmethod
+    def _visible_key(roles: list[str], model_params: dict) -> tuple:
+        """The cache key for a visible count: the FULL roles set, sorted and
+        de-duplicated, and the embedding model. Never a user id (two users with
+        one roles set see the same chunks; one user's roles can change)."""
+        return (tuple(sorted(set(roles))), tuple(sorted(model_params.items())))
+
+    async def _visible_chunk_count(self, roles: list[str], model_sql: str, model_params: dict) -> int:
+        """Chunks the roles set may read, with the SAME filters the search
+        applies (held, audience, model), cached briefly per roles set."""
+        key = self._visible_key(roles, model_params)
+        hit = self._visible_counts.get(key)
+        now = time.monotonic()
+        if hit is not None and now - hit[1] < self.VISIBLE_COUNT_TTL_S:
+            return hit[0]
+        where = [self._NOT_HELD, self._ROLES_WHERE] + ([model_sql] if model_sql else [])
+        async with self._engine.connect() as conn:
+            n = (await conn.execute(text(f"""
+                SELECT count(*)
+                FROM chunk_embeddings ce
+                JOIN page_chunks c ON c.chunk_id = ce.chunk_id
+                JOIN pages p ON p.page_id = c.page_id
+                JOIN docs d ON d.doc_id = p.doc_id
+                WHERE {' AND '.join(where)}
+                """), {"roles": roles, **model_params})).scalar() or 0
+        self._visible_counts[key] = (int(n), now)
+        return int(n)
+
     async def search_pages(
         self,
         embedding: list[float],
@@ -965,17 +1013,79 @@ class PageIndexStore:
             where.append(model_sql)
             params.update(model_params)
         where_sql = f"WHERE {' AND '.join(where)}"
+        # The GLOBAL shape (no page_ids: chunk-first recall over the whole
+        # corpus) is driven by the HNSW index. Its default scan hands over
+        # ef_search candidates and the WHERE above then filters them: when the
+        # nearest chunks are ones this caller may not read (another audience,
+        # a held doc, another embedding model), it came back with fewer than
+        # top_k rows, often none, silently. Iterative scan keeps walking the
+        # index until top_k rows pass the filter (noomesh-internal i785: at a
+        # seeded 300k chunks, underfill 10/50 -> 0 for broad audiences at about
+        # the same latency, 45/50 -> 0 for a ~3% audience at ~2 s cold / 75 ms
+        # warm). relaxed_order may return the index's rows slightly out of
+        # order, so they are re-sorted by distance outside the MATERIALIZED
+        # subquery. The filter stays IN the one statement: a stopped scan
+        # returns fewer rows, never an unfiltered one. The page-scoped shape is
+        # exact KNN over a small candidate set and is left as it was.
+        #
+        # A NARROW audience on the global shape takes the exact path instead
+        # (EXACT_VISIBLE_MAX_CHUNKS): the chunks it may read are materialised
+        # first, docs -> pages -> chunks with the held and audience filters, and
+        # only their embeddings are fetched and ranked. Nested loops by primary
+        # key keep that statement from scanning every embedding. Either path
+        # holds every filter in its one statement, so a stale or wrong count can
+        # only pick the slower path, never widen the result.
+        exact = (
+            not page_ids
+            and roles is not None
+            and await self._visible_chunk_count(roles, model_sql, model_params) <= self.EXACT_VISIBLE_MAX_CHUNKS
+        )
         async with self._engine.connect() as conn:
+            if exact:
+                await conn.execute(text("SET LOCAL enable_hashjoin = off"))
+                await conn.execute(text("SET LOCAL enable_mergejoin = off"))
+                model_where = f"WHERE {model_sql}" if model_sql else ""
+                result = await conn.execute(
+                    text(f"""
+                    WITH vis AS MATERIALIZED (
+                        SELECT c.chunk_id, c.page_id, c.chunk_no, c.text
+                        FROM docs d
+                        JOIN pages p ON p.doc_id = d.doc_id
+                        JOIN page_chunks c ON c.page_id = p.page_id
+                        WHERE {self._NOT_HELD} AND {self._ROLES_WHERE}
+                    )
+                    SELECT v.chunk_id, v.page_id, v.chunk_no, v.text,
+                           1 - (ce.embedding <=> CAST(:vec AS vector)) AS score
+                    FROM vis v
+                    JOIN chunk_embeddings ce ON ce.chunk_id = v.chunk_id
+                    {model_where}
+                    ORDER BY (ce.embedding <=> CAST(:vec AS vector)) + 0
+                    LIMIT :top_k
+                    """),
+                    params,
+                )
+                rows = result.fetchall()
+                return [
+                    {"chunk_id": str(r[0]), "page_id": str(r[1]), "chunk_no": r[2], "text": r[3], "score": float(r[4])}
+                    for r in rows
+                ]
+            if not page_ids:
+                await conn.execute(text("SET LOCAL hnsw.iterative_scan = relaxed_order"))
             result = await conn.execute(
                 text(f"""
-                SELECT c.chunk_id, c.page_id, c.chunk_no, c.text,
-                       1 - (ce.embedding <=> CAST(:vec AS vector)) AS score
-                FROM chunk_embeddings ce
-                JOIN page_chunks c ON c.chunk_id = ce.chunk_id
-                {join_docs}
-                {where_sql}
-                ORDER BY ce.embedding <=> CAST(:vec2 AS vector)
-                LIMIT :top_k
+                WITH ranked AS MATERIALIZED (
+                    SELECT c.chunk_id, c.page_id, c.chunk_no, c.text,
+                           ce.embedding <=> CAST(:vec AS vector) AS distance
+                    FROM chunk_embeddings ce
+                    JOIN page_chunks c ON c.chunk_id = ce.chunk_id
+                    {join_docs}
+                    {where_sql}
+                    ORDER BY distance
+                    LIMIT :top_k
+                )
+                SELECT chunk_id, page_id, chunk_no, text, 1 - distance AS score
+                FROM ranked
+                ORDER BY distance
                 """),
                 params,
             )
