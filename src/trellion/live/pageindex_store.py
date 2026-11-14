@@ -965,17 +965,38 @@ class PageIndexStore:
             where.append(model_sql)
             params.update(model_params)
         where_sql = f"WHERE {' AND '.join(where)}"
+        # The GLOBAL shape (no page_ids: chunk-first recall over the whole
+        # corpus) is driven by the HNSW index. Its default scan hands over
+        # ef_search candidates and the WHERE above then filters them: when the
+        # nearest chunks are ones this caller may not read (another audience,
+        # a held doc, another embedding model), it came back with fewer than
+        # top_k rows, often none, silently. Iterative scan keeps walking the
+        # index until top_k rows pass the filter (noomesh-internal i785: at a
+        # seeded 300k chunks, underfill 10/50 -> 0 for broad audiences at about
+        # the same latency, 45/50 -> 0 for a ~3% audience at ~2 s cold / 75 ms
+        # warm). relaxed_order may return the index's rows slightly out of
+        # order, so they are re-sorted by distance outside the MATERIALIZED
+        # subquery. The filter stays IN the one statement: a stopped scan
+        # returns fewer rows, never an unfiltered one. The page-scoped shape is
+        # exact KNN over a small candidate set and is left as it was.
         async with self._engine.connect() as conn:
+            if not page_ids:
+                await conn.execute(text("SET LOCAL hnsw.iterative_scan = relaxed_order"))
             result = await conn.execute(
                 text(f"""
-                SELECT c.chunk_id, c.page_id, c.chunk_no, c.text,
-                       1 - (ce.embedding <=> CAST(:vec AS vector)) AS score
-                FROM chunk_embeddings ce
-                JOIN page_chunks c ON c.chunk_id = ce.chunk_id
-                {join_docs}
-                {where_sql}
-                ORDER BY ce.embedding <=> CAST(:vec2 AS vector)
-                LIMIT :top_k
+                WITH ranked AS MATERIALIZED (
+                    SELECT c.chunk_id, c.page_id, c.chunk_no, c.text,
+                           ce.embedding <=> CAST(:vec AS vector) AS distance
+                    FROM chunk_embeddings ce
+                    JOIN page_chunks c ON c.chunk_id = ce.chunk_id
+                    {join_docs}
+                    {where_sql}
+                    ORDER BY distance
+                    LIMIT :top_k
+                )
+                SELECT chunk_id, page_id, chunk_no, text, 1 - distance AS score
+                FROM ranked
+                ORDER BY distance
                 """),
                 params,
             )
