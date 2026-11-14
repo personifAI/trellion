@@ -49,7 +49,20 @@ OTHER_MODEL = "bench-model-b"
 # The audiences: most documents are untagged (readable with the generic `user`
 # role); a few carry a role. `finance` is the restricted audience the probes aim at.
 AUDIENCES = [(None, 0.85), (["staff"], 0.10), (["finance"], 0.03), (["legal"], 0.02)]
-SETTINGS = ["off", "relaxed_order", "strict_order"]
+# (name, GUCs on every connection, fallback GUCs or None). A fallback runs the
+# first set; only when that comes back SHORT (fewer than top_k rows) does it run
+# the query again with the fallback set, and the latency is the sum. Set per
+# engine (libpq startup options), so the code under test is unchanged.
+RELAXED = {"hnsw.iterative_scan": "relaxed_order"}
+SETTINGS = [
+    ("off (today)", {}, None),
+    ("relaxed", dict(RELAXED), None),
+    ("relaxed, ef_search 100", {**RELAXED, "hnsw.ef_search": "100"}, None),
+    ("relaxed, max_scan_tuples 5000", {**RELAXED, "hnsw.max_scan_tuples": "5000"}, None),
+    ("off, then relaxed when short", {}, dict(RELAXED)),
+    ("off, then relaxed (max_scan_tuples 5000) when short", {}, {**RELAXED, "hnsw.max_scan_tuples": "5000"}),
+]
+TIE = 0.005  # a returned chunk within this similarity of the k-th exact one counts as a hit
 
 
 class Vec(list):
@@ -71,7 +84,12 @@ def refuse_unless_local(dsn: str) -> None:
 
 def build_world(n_chunks: int, n_pages: int, n_docs: int, seed: int) -> dict:
     rng = np.random.default_rng(seed)
-    centroids = unit(rng.standard_normal((2000, DIM)).astype(np.float32))
+    # Overlapping topics: 2,000 topics around 100 shared super-topics (topic to
+    # super cosine ~0.7), chunks around their topic. The first run's 2,000
+    # independent clusters stranded HNSW's greedy search (recall 0.68 with no
+    # restrictive filter); real embeddings are not islands.
+    supers = unit(rng.standard_normal((100, DIM)).astype(np.float32))
+    centroids = unit(supers[rng.integers(0, 100, 2000)] + rng.standard_normal((2000, DIM)).astype(np.float32) / np.sqrt(DIM))
     doc_topic = rng.integers(0, len(centroids), n_docs)
     roll = rng.random(n_docs)
     edges = np.cumsum([w for _, w in AUDIENCES])
@@ -91,7 +109,7 @@ def build_world(n_chunks: int, n_pages: int, n_docs: int, seed: int) -> dict:
     for i in range(0, n_chunks, step):
         j = min(i + step, n_chunks)
         # noise of norm ~0.8 around a unit centroid: clustered, not separable by topic alone
-        vecs[i:j] = unit(centroids[doc_topic[chunk_doc[i:j]]] + 0.8 * rng.standard_normal((j - i, DIM)).astype(np.float32) / np.sqrt(DIM))
+        vecs[i:j] = unit(centroids[doc_topic[chunk_doc[i:j]]] + 0.6 * rng.standard_normal((j - i, DIM)).astype(np.float32) / np.sqrt(DIM))
     chunk_model = np.where(rng.random(n_chunks) < 0.05, 1, 0)  # 5% still on the old model
     return {
         "doc_ids": [uuid.uuid4() for _ in range(n_docs)],
@@ -222,7 +240,7 @@ def restart_cold(container: str) -> None:
 
 
 async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: str) -> list[dict]:
-    from sqlalchemy import event, text
+    from sqlalchemy import event
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from trellion.db.engine import TRELLION_SCHEMA, _async_dsn
@@ -232,15 +250,19 @@ async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: st
     page_id_str = [str(p) for p in w["page_ids"]]
     scopes = [page_scope(w, q["vec"]) for q in queries]
     rows = []
-    for setting in SETTINGS:
-        admin = create_async_engine(_async_dsn(dsn))
-        async with admin.connect() as c:
-            await c.execution_options(isolation_level="AUTOCOMMIT")
-            await c.execute(text(f"ALTER DATABASE {db} SET hnsw.iterative_scan = '{setting}'"))
-        await admin.dispose()
+    index_of = {str(c): i for i, c in enumerate(w["chunk_ids"])}
+
+    def engine(gucs: dict):
+        opts = f"-csearch_path={TRELLION_SCHEMA},public" + "".join(f" -c {k}={v}" for k, v in gucs.items())
+        return create_async_engine(_async_dsn(dsn), connect_args={"options": opts})
+
+    for setting, gucs, fallback in SETTINGS:
         for shape, roles, k, scoped in SHAPES:
             restart_cold(container)
-            eng = create_async_engine(_async_dsn(dsn), connect_args={"options": f"-csearch_path={TRELLION_SCHEMA},public"})
+            eng = engine(gucs)
+            eng_fb = engine(fallback) if fallback is not None else None
+            store_fb = PageIndexStore(async_engine=eng_fb, embedding_dim=DIM) if eng_fb else None
+            fell_back = 0
             seen_sql: list = []
 
             @event.listens_for(eng.sync_engine, "before_cursor_execute")
@@ -257,6 +279,10 @@ async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: st
                     pids = [page_id_str[i] for i in scopes[qi]] if scoped else None
                     t = time.perf_counter()
                     got = await store.search_chunks(Vec(q["vec"].tolist()), top_k=k, page_ids=pids, roles=roles)
+                    if store_fb is not None and len(got) < k:
+                        got = await store_fb.search_chunks(Vec(q["vec"].tolist()), top_k=k, page_ids=pids, roles=roles)
+                        if p == 2:
+                            fell_back += 1
                     lat.append((time.perf_counter() - t) * 1000)
                     if p == 2:
                         results.append(got)
@@ -269,13 +295,18 @@ async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: st
                     r = await c.exec_driver_sql("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + stmt, params)
                     plan_txt = "\n".join(x[0] for x in r.fetchall())
             await eng.dispose()
-            recalls, under, leaks = [], 0, 0
+            if eng_fb is not None:
+                await eng_fb.dispose()
+            recalls, strict, under, leaks = [], [], 0, 0
             vis = visible(w, roles) if roles is not None else None
             for qi, q in enumerate(queries):
                 want = exact(w, q["vec"], k, roles, scopes[qi] if scoped else None)
                 got = [g["chunk_id"] for g in results[qi]]
                 if want:
-                    recalls.append(len(set(got) & set(want)) / len(want))
+                    strict.append(len(set(got) & set(want)) / len(want))
+                    kth = float(w["vecs"][index_of[want[-1]]] @ q["vec"])
+                    hits = sum(1 for g in got if g in want or float(w["vecs"][index_of[g]] @ q["vec"]) >= kth - TIE)
+                    recalls.append(min(hits, len(want)) / len(want))
                 if len(got) < len(want):
                     under += 1
                 if vis is not None:
@@ -292,6 +323,8 @@ async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: st
                 "warm_p95": round(np.percentile(passes[2], 95), 1),
                 "recall": round(float(np.mean(recalls)) if recalls else float("nan"), 3),
                 "min_recall": round(float(np.min(recalls)) if recalls else float("nan"), 3),
+                "strict_recall": round(float(np.mean(strict)) if strict else float("nan"), 3),
+                "fell_back": fell_back if fallback is not None else None,
                 "underfill": under, "leaks": leaks, "plan_text": plan_txt,
             })
             print(json.dumps({k2: v for k2, v in rows[-1].items() if k2 != "plan_text"}), flush=True)
@@ -300,12 +333,12 @@ async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: st
 
 def report(rows: list[dict], n: int, nq: int) -> str:
     out = [f"### search_chunks at {n:,} seeded chunks ({nq} queries per cell; recall vs exact numpy)", "",
-           "| iterative_scan | shape | k | chunk_embeddings access | cold first ms | cold p50/p95 ms | warm p50/p95 ms | recall@k (min) | underfill | audience leaks |",
-           "|---|---|---|---|---|---|---|---|---|---|"]
+           "| setting | shape | k | chunk_embeddings access | cold first ms | cold p50/p95 ms | warm p50/p95 ms | recall@k tie-aware (min) | strict recall | fell back | underfill | audience leaks |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         out.append(f"| {r['setting']} | {r['shape']} | {r['k']} | `{r['plan'][:80]}` | {r['cold_first_ms']} | "
                    f"{r['cold_p50']} / {r['cold_p95']} | {r['warm_p50']} / {r['warm_p95']} | {r['recall']} ({r['min_recall']}) | "
-                   f"{r['underfill']} | {r['leaks']} |")
+                   f"{r['strict_recall']} | {'-' if r['fell_back'] is None else r['fell_back']} | {r['underfill']} | {r['leaks']} |")
     return "\n".join(out) + "\n"
 
 
