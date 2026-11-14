@@ -331,6 +331,100 @@ async def measure(dsn: str, w: dict, queries: list[dict], container: str, db: st
     return rows
 
 
+# --mode share (i785 step 2): is an EXACT search over the caller's visible set
+# cheaper than the relaxed HNSW walk, and below which visible share? One
+# audience per share; the caller holds only that role, and the queries sit
+# near untagged chunks, so the nearest are never its own (HNSW's worst case).
+SHARE_AUDIENCES = [(None, 0.56), (["a1"], 0.01), (["a3"], 0.03), (["a10"], 0.10), (["a30"], 0.30)]
+
+
+def exact_sql() -> str:
+    """search_chunks' statement with the distance ordering made unusable by the
+    HNSW index (`+ 0`), so the plan is an exact scan of the rows that pass the
+    filter. Same filter, in the same statement."""
+    from trellion_protocols.schema import ROLES_WHERE
+
+    return f"""
+        SELECT c.chunk_id, c.page_id, c.chunk_no, c.text,
+               ce.embedding <=> CAST(:vec AS vector) AS distance
+        FROM chunk_embeddings ce
+        JOIN page_chunks c ON c.chunk_id = ce.chunk_id
+        JOIN pages p ON p.page_id = c.page_id
+        JOIN docs d ON d.doc_id = p.doc_id
+        WHERE d.held_at IS NULL AND {ROLES_WHERE} AND ce.embedding_model = :emb_model
+        ORDER BY (ce.embedding <=> CAST(:vec AS vector)) + 0
+        LIMIT :top_k"""
+
+
+async def measure_share(dsn: str, w: dict, queries: list[dict], container: str) -> list[dict]:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from trellion.db.engine import TRELLION_SCHEMA, _async_dsn
+    from trellion.live.pageindex_store import PageIndexStore
+
+    index_of = {str(c): i for i, c in enumerate(w["chunk_ids"])}
+    doc_of_chunk = {str(w["chunk_ids"][i]): int(w["chunk_doc"][i]) for i in range(len(w["chunk_ids"]))}
+    k = 20
+    sql = text(exact_sql())
+    rows = []
+    for aud, share in SHARE_AUDIENCES[1:]:
+        roles = aud
+        vis = visible(w, roles)
+        for path in ("relaxed HNSW (search_chunks)", "exact over the visible set"):
+            restart_cold(container)
+            opts = f"-csearch_path={TRELLION_SCHEMA},public" + (" -c hnsw.iterative_scan=relaxed_order" if path.startswith("relaxed") else "")
+            eng = create_async_engine(_async_dsn(dsn), connect_args={"options": opts})
+            store = PageIndexStore(async_engine=eng, embedding_dim=DIM)
+            passes, results = [], []
+            for p in range(3):
+                lat = []
+                for q in queries:
+                    t = time.perf_counter()
+                    if path.startswith("relaxed"):
+                        got = [g["chunk_id"] for g in await store.search_chunks(Vec(q["vec"].tolist()), top_k=k, roles=roles)]
+                    else:
+                        async with eng.connect() as c:
+                            r = await c.execute(sql, {"vec": "[" + ",".join(f"{x:.6f}" for x in q["vec"]) + "]",
+                                                      "roles": roles, "emb_model": MODEL, "top_k": k})
+                            got = [str(x[0]) for x in r.fetchall()]
+                    lat.append((time.perf_counter() - t) * 1000)
+                    if p == 2:
+                        results.append(got)
+                passes.append(lat)
+            await eng.dispose()
+            recalls, under, leaks = [], 0, 0
+            for qi, q in enumerate(queries):
+                want = exact(w, q["vec"], k, roles, None)
+                got = results[qi]
+                if want:
+                    kth = float(w["vecs"][index_of[want[-1]]] @ q["vec"])
+                    hits = sum(1 for g in got if g in want or float(w["vecs"][index_of[g]] @ q["vec"]) >= kth - TIE)
+                    recalls.append(min(hits, len(want)) / len(want))
+                under += len(got) < len(want)
+                leaks += sum(1 for g in got if not vis[doc_of_chunk[g]])
+            rows.append({
+                "share": f"{share:.0%}", "visible_chunks": int(vis[w["chunk_doc"]].sum()), "path": path,
+                "cold_first_ms": round(passes[0][0], 1),
+                "cold_p50": round(statistics.median(passes[0]), 1), "cold_p95": round(np.percentile(passes[0], 95), 1),
+                "warm_p50": round(statistics.median(passes[2]), 1), "warm_p95": round(np.percentile(passes[2], 95), 1),
+                "recall": round(float(np.mean(recalls)) if recalls else float("nan"), 3),
+                "underfill": under, "leaks": leaks,
+            })
+            print(json.dumps(rows[-1]), flush=True)
+    return rows
+
+
+def report_share(rows: list[dict], n: int, nq: int) -> str:
+    out = [f"### visible share: exact vs relaxed HNSW at {n:,} seeded chunks ({nq} queries near untagged chunks, k=20)", "",
+           "| visible share | visible chunks | path | cold first ms | cold p50/p95 ms | warm p50/p95 ms | recall@20 tie-aware | underfill | leaks |",
+           "|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        out.append(f"| {r['share']} | {r['visible_chunks']:,} | {r['path']} | {r['cold_first_ms']} | {r['cold_p50']} / {r['cold_p95']} | "
+                   f"{r['warm_p50']} / {r['warm_p95']} | {r['recall']} | {r['underfill']} | {r['leaks']} |")
+    return "\n".join(out) + "\n"
+
+
 def report(rows: list[dict], n: int, nq: int) -> str:
     out = [f"### search_chunks at {n:,} seeded chunks ({nq} queries per cell; recall vs exact numpy)", "",
            "| setting | shape | k | chunk_embeddings access | cold first ms | cold p50/p95 ms | warm p50/p95 ms | recall@k tie-aware (min) | strict recall | fell back | underfill | audience leaks |",
@@ -351,11 +445,33 @@ def main() -> int:
     ap.add_argument("--queries", type=int, default=50)
     ap.add_argument("--seed", type=int, default=785)
     ap.add_argument("--out", default="bench-out")
+    ap.add_argument("--mode", choices=["settings", "share"], default="settings",
+                    help="settings: iterative-scan settings per shape; share: exact vs relaxed by visible share")
     a = ap.parse_args()
     refuse_unless_local(a.dsn)
     random.seed(a.seed)
+    global AUDIENCES
+    if a.mode == "share":
+        AUDIENCES = SHARE_AUDIENCES
     w = build_world(a.chunks, a.chunks // 5, a.chunks // 60, a.seed)
     asyncio.run(seed(a.dsn, w))
+    if a.mode == "share":
+        rng = np.random.default_rng(a.seed + 2)
+        public = np.flatnonzero((w["doc_aud"][w["chunk_doc"]] == 0) & ~w["doc_held"][w["chunk_doc"]] & (w["chunk_model"] == 0))
+        queries = [{"vec": unit(w["vecs"][rng.choice(public)] + 0.1 * rng.standard_normal(DIM).astype(np.float32) / np.sqrt(DIM)),
+                    "kind": "near-untagged"} for _ in range(a.queries)]
+        rows = asyncio.run(measure_share(a.dsn, w, queries, a.container))
+        md = report_share(rows, a.chunks, a.queries)
+        os.makedirs(a.out, exist_ok=True)
+        with open(os.path.join(a.out, "results.md"), "w") as f:
+            f.write(md)
+        with open(os.path.join(a.out, "results.json"), "w") as f:
+            json.dump(rows, f, indent=1)
+        print(md)
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                f.write(md)
+        return 1 if any(r["leaks"] for r in rows) else 0
     queries = make_queries(w, a.queries, a.seed)
     rows = asyncio.run(measure(a.dsn, w, queries, a.container, a.db))
     os.makedirs(a.out, exist_ok=True)

@@ -23,6 +23,9 @@ on:
       queries:
         description: 'query vectors per cell'
         default: '50'
+      mode:
+        description: 'settings (iterative-scan settings per shape) or share (exact vs relaxed by visible share)'
+        default: 'settings'
       image:
         description: "the stack's postgres image"
         default: 'ghcr.io/noomesh/postgres-pgvector:v0.6.24-rc.7'
@@ -70,10 +73,11 @@ jobs:
         env:
           CHUNKS: ${{ inputs.chunks }}
           QUERIES: ${{ inputs.queries }}
+          MODE: ${{ inputs.mode }}
         run: |
           python scripts/bench_chunk_search.py \
             --dsn postgresql+asyncpg://noo:benchpw@localhost:5432/noomesh \
-            --container bench-pg --chunks "$CHUNKS" --queries "$QUERIES" --out bench-out
+            --container bench-pg --chunks "$CHUNKS" --queries "$QUERIES" --mode "$MODE" --out bench-out
       - name: Results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
