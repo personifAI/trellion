@@ -47,7 +47,12 @@ async def world():
 
     # The index drives the plan (as at scale), with a small candidate list, so
     # a filtered-out nearest set is enough to empty a non-iterative scan.
-    opts = f"-csearch_path={TRELLION_SCHEMA},public -c enable_seqscan=off -c hnsw.ef_search=10"
+    # enable_sort off as well: the joined, filtered statement otherwise finds a
+    # sort-based plan at test size, and the property below would be about an
+    # exact scan (the first version of this test passed with the iterative scan
+    # removed for that reason).
+    opts = (f"-csearch_path={TRELLION_SCHEMA},public -c enable_seqscan=off -c enable_sort=off"
+            " -c hnsw.ef_search=10")
     eng = create_async_engine(_async_dsn(DSN), connect_args={"options": opts})
     store = PageIndexStore(async_engine=eng, embedding_dim=DIM)
     tag = f"filt-{uuid.uuid4().hex[:10]}"
@@ -94,16 +99,24 @@ async def test_a_narrow_audience_still_gets_top_k_when_the_nearest_chunks_are_no
     finance = await make("finance", ["finance"], [_vec(0.8, 0.6, jitter=0.01, rng=rng) for _ in range(6)])
     q = _vec(1.0)
 
-    # The HNSW index drives this engine's plan (the shape at scale), so the
-    # property below is about the index walk, not an exact sequential scan.
-    vec = "[" + ",".join(str(x) for x in q) + "]"
-    async with eng.connect() as c:
-        plan = "\n".join(r[0] for r in (await c.execute(text(
-            "EXPLAIN SELECT chunk_id FROM chunk_embeddings ORDER BY embedding <=> CAST(:v AS vector) LIMIT 5"),
-            {"v": vec})).fetchall())
-    assert "chunk_embeddings_hnsw_idx" in plan, plan
+    from sqlalchemy import event
+
+    seen: list = []
+
+    @event.listens_for(eng.sync_engine, "before_cursor_execute")
+    def grab(conn, cursor, statement, params, context, executemany):  # noqa: ANN001
+        if "chunk_embeddings" in statement and "ORDER BY" in statement:
+            seen[:] = [(statement, params)]
 
     got = await store.search_chunks(q, top_k=5, roles=["finance"])
+
+    # The HNSW index drives THIS statement's plan (the shape at scale), so the
+    # property is about the index walk, not an exact scan of a small table.
+    assert seen, "search_chunks issued no chunk statement"
+    stmt, params = seen[0]
+    async with eng.connect() as c:
+        plan = "\n".join(r[0] for r in (await c.exec_driver_sql("EXPLAIN " + stmt, params)).fetchall())
+    assert "chunk_embeddings_hnsw_idx" in plan, plan
     ids = [c["chunk_id"] for c in got]
     assert len(ids) == 5, f"a narrow audience came back short ({len(ids)} of 5): the scan stopped at filtered-out candidates"
     assert set(ids) <= set(finance)
