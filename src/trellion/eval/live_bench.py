@@ -233,8 +233,11 @@ async def run_live_bench(
     # Pin search_path the way every real caller does (trellion's tables
     # live in schema `trellion`; a raw engine sees only `public`) — same
     # convention as trellion.db.engine and the temporal-graph test fixture.
+    from trellion.db.pool_budget import pool_args
+
     engine = create_async_engine(
         _async_dsn(dsn),
+        **pool_args("live_bench"),
         connect_args={"options": f"-csearch_path={TRELLION_SCHEMA},public"},
     )
     store = PageIndexStore(
