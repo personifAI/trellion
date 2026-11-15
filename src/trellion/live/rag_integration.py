@@ -114,8 +114,14 @@ class PageIndexRAG:
         embedding_model: Optional[str] = None,
         ocr_config=None,
         capability_router=None,
+        async_engine=None,
     ) -> None:
         self.dsn = dsn
+        # The store's engine, when the host builds and sizes it (noomesh's
+        # POOL_BUDGET["pageindex_store"]). None: the store builds one from
+        # ``dsn``, sized by trellion.db.pool_budget["pageindex_store"]
+        # (5 + 3, noomesh i815).
+        self._store_engine = async_engine
         self.embedding_url = embedding_url
         self.llm_url = llm_url
         self.llm_model = llm_model
@@ -157,7 +163,10 @@ class PageIndexRAG:
         await self.schema.ensure_tables()
 
         # 2. Connect store
-        self.store = PageIndexStore(dsn=self.dsn)
+        if self._store_engine is not None:
+            self.store = PageIndexStore(async_engine=self._store_engine)
+        else:
+            self.store = PageIndexStore(dsn=self.dsn)
         await self.store.connect()
 
         # 3. Wire components
