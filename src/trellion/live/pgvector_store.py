@@ -67,7 +67,10 @@ class PGVectorStore:
         elif config.dsn:
             from trellion.db.engine import _sync_dsn
             from sqlalchemy import create_engine
-            self._engine = create_engine(_sync_dsn(config.dsn), pool_pre_ping=True)
+            from trellion.db.pool_budget import pool_args
+            self._engine = create_engine(
+                _sync_dsn(config.dsn), **pool_args("pgvector_store_dsn"), pool_pre_ping=True
+            )
         else:
             from trellion.db.engine import get_engine
             self._engine = get_engine()
