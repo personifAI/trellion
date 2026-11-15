@@ -111,7 +111,11 @@ class ConversationStore:
             self._engine = async_engine
         elif dsn is not None:
             from trellion.db.engine import _async_dsn
-            self._engine = create_async_engine(_async_dsn(dsn), pool_pre_ping=True)
+            from trellion.db.pool_budget import pool_args
+            # Standalone only: noomesh hands this store its own budgeted engine.
+            self._engine = create_async_engine(
+                _async_dsn(dsn), **pool_args("conversation_store_dsn"), pool_pre_ping=True
+            )
         else:
             from trellion.db.engine import get_async_engine
             self._engine = get_async_engine()

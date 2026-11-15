@@ -48,11 +48,21 @@ def _async_dsn(dsn: str) -> str:
     return _sync_dsn(dsn)
 
 
-def init_engine(dsn: str, pool_size: int = 10, max_overflow: int = 20) -> tuple[Engine, AsyncEngine]:
+def init_engine(dsn: str) -> tuple[Engine, AsyncEngine]:
     """Create and store the shared engines.
 
     Idempotent — repeated calls dispose the prior engines first.
+
+    Sizes come from ``trellion.db.pool_budget`` (async 5 + 10, sync 2 + 3;
+    noomesh i815), not from the caller: noomesh's
+    ``workers/common._trellion_engine`` calls ``init_engine(dsn)`` in
+    noo-trellion and its ``tests/test_pg_pool_budget.py`` sums these
+    ceilings against ``max_connections``. (Until 2026-11 this took
+    ``pool_size=10, max_overflow=20`` for BOTH engines, a 60-connection
+    ceiling no caller overrode.)
     """
+    from .pool_budget import pool_args
+
     global _engine, _async_engine
 
     if _engine is not None:
@@ -81,8 +91,7 @@ def init_engine(dsn: str, pool_size: int = 10, max_overflow: int = 20) -> tuple[
     _sp = {"options": f"-csearch_path={TRELLION_SCHEMA},public"}
     _engine = create_engine(
         sync_url,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
+        **pool_args("sync_engine"),
         pool_timeout=30,
         pool_pre_ping=True,
         pool_recycle=3600,
@@ -90,8 +99,7 @@ def init_engine(dsn: str, pool_size: int = 10, max_overflow: int = 20) -> tuple[
     )
     _async_engine = create_async_engine(
         async_url,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
+        **pool_args("async_engine"),
         pool_timeout=30,
         pool_pre_ping=True,
         pool_recycle=3600,

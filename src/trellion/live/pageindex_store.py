@@ -114,14 +114,19 @@ class PageIndexStore:
             self._engine = async_engine
         elif dsn is not None:
             from trellion.db.engine import TRELLION_SCHEMA, _async_dsn
+            from trellion.db.pool_budget import pool_args
             from sqlalchemy.ext.asyncio import create_async_engine
             # Pin search_path like every other engine builder (db/engine.py):
             # trellion's tables live in schema `trellion` and every query
             # here is unqualified — a raw engine sees only `public`, which
             # is exactly the fresh-install failure the temporal-graph test
             # fixture documents. Found live by the P1.5 bench harness.
+            # Sized by the budget (5 + 3, noomesh i815), not SQLAlchemy's
+            # default 5 + 10: PageIndexRAG.startup builds the store this way
+            # in noo-trellion.
             self._engine = create_async_engine(
                 _async_dsn(dsn),
+                **pool_args("pageindex_store"),
                 pool_pre_ping=True,
                 connect_args={"options": f"-csearch_path={TRELLION_SCHEMA},public"},
             )
