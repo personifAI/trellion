@@ -73,6 +73,7 @@ async def _record_usage(store, page_ids: list[str]) -> None:
 def schedule_usage_record(store, page_ids: list[str]) -> None:
     """Count these pages as retrieved, off the request path. Never raises."""
     try:
+        page_ids = [i for i in page_ids if isinstance(i, str) and i]
         if not page_ids or not _usage_enabled() or len(_USAGE_TASKS) >= _USAGE_MAX_INFLIGHT:
             return
         record = getattr(store, "record_page_usage", None)
@@ -303,7 +304,7 @@ class PageIndexRetriever:
 
         # Step 4: Build evidence packs
         evidence = await self.build_evidence(pages, chunks)
-        schedule_usage_record(self.store, [e.page_id for e in evidence])
+        schedule_usage_record(self.store, [getattr(e, "page_id", None) for e in evidence])
         return evidence
 
     async def retrieve_pages(

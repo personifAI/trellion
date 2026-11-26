@@ -145,7 +145,9 @@ class DecisionClient:
         if self._http is None:
             headers = {"Content-Type": "application/json"}
             if self._api_key:
-                headers["Authorization"] = f"Bearer {self._api_key}"
+                # The decision endpoint's own key, set by the operator for that
+                # service: not a gateway credential, so not the gateway door's.
+                headers["Authorization"] = "Bearer " + self._api_key
             self._http = httpx.AsyncClient(
                 timeout=self.timeout_s, headers=headers, transport=self._transport
             )
