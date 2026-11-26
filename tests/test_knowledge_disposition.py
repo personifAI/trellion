@@ -348,6 +348,7 @@ class TaggedClient(FakeClient):
         self.tag, self.answers = tag, answers
 
     async def ask(self, spec, page):
+        self.asked.append(page["page_id"])
         title = page["title"] or ""
         if not title.startswith(self.tag):
             return {}
@@ -473,7 +474,8 @@ async def test_an_edited_page_is_not_given_a_stale_decision(world):
         await c.execute(text("UPDATE pages SET text = 'changed' WHERE page_id = CAST(:p AS uuid)"), {"p": p["page_id"]})
     wrote = await ks.write_disposition(
         page_id=p["page_id"], seen=row["seen"], spec_version=1, would_embed=True,
-        would_graph=True, held=False, answers={"embed": 1}, model=None, review_after=None)
+        would_graph=True, held=False, thresholds={}, spec_hash="h", question_ids=[],
+        answers={"embed": 1}, model=None, review_after=None)
     assert wrote is False
     assert await _row(eng, "SELECT 1 FROM page_dispositions WHERE page_id = CAST(:p AS uuid)", p=p["page_id"]) == []
 
