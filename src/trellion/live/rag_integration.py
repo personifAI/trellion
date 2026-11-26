@@ -142,6 +142,7 @@ class PageIndexRAG:
         self.classifier: Optional[BackgroundWorker] = None
         self.relation_extractor: Optional[BackgroundWorker] = None
         self.entity_embedder: Optional[BackgroundWorker] = None
+        self.disposition_worker: Optional[BackgroundWorker] = None
         self.clusterer: Optional[ClusterBuilder] = None
         self.retriever: Optional[PageIndexRetriever] = None
         self.orchestrator: Optional[RAGOrchestrator] = None
@@ -320,6 +321,21 @@ class PageIndexRAG:
                 log.warning("pageindex_rag.entity_embedder_start_failed", exc_info=True)
         # Note: clusterer is not auto-started; it runs on-demand via heartbeat task
 
+        # Knowledge disposition, shadow mode: records what a decision model
+        # would do with each page. Inert (no worker) unless TRELLION_DECISION_URL
+        # is set; changes nothing about what is embedded or extracted.
+        try:
+            from .knowledge_disposition import DispositionWorker
+
+            engine = getattr(self.store, "_engine", None)
+            if engine is not None:
+                self.disposition_worker = DispositionWorker.from_env(engine)
+            if self.disposition_worker is not None:
+                await self.disposition_worker.start()
+        except Exception:
+            log.warning("pageindex_rag.disposition_worker_start_failed", exc_info=True)
+            self.disposition_worker = None
+
         # 6. Start the graph metrics provider (add-on)
         await self._start_signal_computer()
 
@@ -370,6 +386,11 @@ class PageIndexRAG:
         log.info("pageindex_rag_stopped")
 
     async def _stop_background_workers(self) -> None:
+        if self.disposition_worker:
+            try:
+                await self.disposition_worker.stop()
+            except Exception:
+                log.warning("pageindex_rag.disposition_worker_stop_failed", exc_info=True)
         # Stop graph enrichment workers (reverse order: embedder, classifier)
         if self.entity_embedder:
             try:

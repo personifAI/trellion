@@ -318,3 +318,23 @@ For completeness, so nobody greps trellion for them: `NOO_TRELLION_DATABASE_URL`
 channel/cloud-provider variables are consumed by noomesh's worker pool, not by
 `src/trellion`. They are declared in `docker-compose.trellion.yml` in the
 noomesh stack, which is the authority for them.
+
+## Knowledge disposition (`TRELLION_DECISION_*`)
+
+Shadow mode only: these record decisions and page usage and change nothing
+about indexing. See `docs/architecture.md`. Deployment settings; not set by the
+stack. **Page titles, source names, headers and text are sent to
+`TRELLION_DECISION_URL`: it must be a service you run yourself.** Only
+documents readable by a plain `user` are sent.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TRELLION_DECISION_URL` | unset | Decision endpoint (SystemOne wire format). Unset: the disposition pass does not run. A bare host URL gets `/v1/systemone` appended. A warning is logged at start (host only) when it is not loopback or a private-range address. |
+| `TRELLION_DECISION_MODEL` | unset | Model name sent in the request; omitted when unset. |
+| `TRELLION_DECISION_API_KEY` | unset | Optional bearer token. Never logged. |
+| `TRELLION_DECISION_TIMEOUT_S` | `20` | Per-request timeout, bounded to 1 to 120. One retry on a timeout, connection error, 429 or 5xx. |
+| `TRELLION_DECISION_MAX_CHARS` | `4000` | Page text sent, in characters, bounded to 200 to 50000. |
+| `TRELLION_DECISION_MAX_PAGES_PER_HOUR` | `600` | Upper bound on pages asked per hour (1 to 100000). |
+| `TRELLION_DECISION_INTERVAL_S` | `120` | Idle sleep between passes (5 to 86400). While the endpoint fails, one probe page is sent per backoff period (120 s, doubling, at most an hour). |
+| `TRELLION_DECISION_BATCH` | `32` | Pages per pass (1 to 500). |
+| `TRELLION_DECISION_CONCURRENCY` | `4` | Requests in flight (1 to 16). |
