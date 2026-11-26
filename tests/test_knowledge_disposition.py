@@ -556,7 +556,6 @@ async def test_restricted_audience_documents_are_not_sent(world):
                 {"r": __import__("json").dumps(roles), "d": d["doc_id"]},
             )
     ks = KnowledgeStore(eng)
-    before = (await ks.disposition_summary())["not_asked_restricted_audience"]
     client = TaggedClient(tag, {t: {"embed": 0.9, "graph": 0.9}
                                 for t in ("plain", "usertag", "restricted", "mixed")})
     dpass = DispositionPass(ks, client, min_age_s=0.0)  # type: ignore[arg-type]
@@ -565,7 +564,9 @@ async def test_restricted_audience_documents_are_not_sent(world):
     assert restricted["page_id"] not in sent
     assert {plain["page_id"], user_tagged["page_id"], mixed["page_id"]} <= sent
     summary = await dpass.summary()
-    assert summary["not_asked_restricted_audience"] - before == 1
+    assert summary["not_asked_restricted_audience"] >= 1  # at least ours (others' leftovers may add)
+    assert await _row(eng, "SELECT 1 FROM page_dispositions WHERE page_id = CAST(:p AS uuid)",
+                      p=restricted["page_id"]) == []
 
 
 @needs_db
