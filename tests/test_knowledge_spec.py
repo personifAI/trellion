@@ -251,3 +251,15 @@ def test_decide_uses_the_specs_own_thresholds_and_version():
     assert d.review_after == NOW + timedelta(days=3)
     assert decide(spec, _answers(0.3, 0.3), NOW).review_after == NOW + timedelta(days=30)
     assert not math.isnan(d.p_embed)
+
+
+def test_body_hash_is_stable_and_tracks_the_content_not_the_version():
+    spec = default_spec()
+    assert spec.body_hash() == default_spec().body_hash()
+    assert len(spec.body_hash()) == 64
+    assert KnowledgeSpec.from_dict(spec.to_dict(), 9).body_hash() == spec.body_hash()
+    body = _body()
+    body["thresholds"]["embed_yes"] = 0.7
+    assert KnowledgeSpec.from_dict(body, 1).body_hash() != spec.body_hash()
+    assert spec.thresholds_dict() == {"embed_yes": 0.6, "graph_yes": 0.6, "hold_below": 0.25}
+    assert spec.question_ids() == ["embed", "graph", "usefulness"]

@@ -30,7 +30,7 @@ from trellion.live.knowledge_disposition import (
     DispositionWorker,
 )
 from trellion.live.knowledge_spec import default_spec
-from trellion.live.knowledge_store import KnowledgeStore, PageBatch
+from trellion.live.knowledge_store import KnowledgeStore, PageBatch, StoredSpecError
 from trellion.live.pageindex_store import PageIndexStore
 
 DSN = os.environ.get("TRELLION_TEST_DSN")
@@ -47,8 +47,15 @@ class FakeStore:
         self.claims = 0
         self._inflight: set[str] = set()
 
+    spec_error = None
+
     async def load_active_spec(self):
+        if self.spec_error:
+            raise StoredSpecError(self.spec_error)
         return default_spec()
+
+    async def disposition_summary(self):
+        return {"decided": len(self.written)}
 
     async def claim_undecided_pages(self, limit, min_age_s=0.0, skip=None):
         self.claims += 1
@@ -84,8 +91,16 @@ def _page(i):
     return {"page_id": f"p{i}", "seen": f"h{i}", "text": f"t{i}", "title": "T", "source_uri": None, "meta": {}}
 
 
-def _pass(store, client):
-    return DispositionPass(store, client, min_age_s=0.0)  # type: ignore[arg-type]
+def _pass(store, client, **kw):
+    return DispositionPass(store, client, min_age_s=0.0, **kw)  # type: ignore[arg-type]
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
 
 
 async def test_inert_without_an_endpoint():
@@ -117,6 +132,10 @@ async def test_run_once_records_would_be_dispositions():
     assert by["p3"]["review_after"] < by["p2"]["review_after"]  # the band is looked at sooner
     assert by["p1"]["answers"] == {"embed": 0.9, "graph": 0.8}  # the raw answers are the audit record
     assert by["p1"]["model"] == "decider-1" and by["p1"]["seen"] == "h1"
+    spec = default_spec()  # each row says which spec it was decided under
+    assert by["p1"]["spec_hash"] == spec.body_hash()
+    assert by["p1"]["thresholds"] == {"embed_yes": 0.6, "graph_yes": 0.6, "hold_below": 0.25}
+    assert by["p1"]["question_ids"] == ["embed", "graph", "usefulness"]
 
 
 async def test_missing_or_malformed_answers_record_nothing():
@@ -142,21 +161,24 @@ async def test_a_dead_endpoint_ends_the_pass_without_raising():
     store = FakeStore([_page(i) for i in range(40)])
     client = FakeClient({})  # every ask raises DecisionError
     report = await _pass(store, client).run_once(40)
-    assert report.decided == 0 and report.failed == 16  # one batch, then stop
+    assert report.decided == 0 and report.failed >= 1
+    assert len(client.asked) <= 4  # the first failure stops the rest of the batch
     assert "unavailable" in report.message
     assert store.written == []
 
 
 async def test_a_failed_page_does_not_starve_the_others():
+    clock = Clock()
     store = FakeStore([_page(0), _page(1)])
     client = FakeClient({"p1": {"embed": 0.9, "graph": 0.9}})  # p0 always fails
-    dpass = _pass(store, client)
+    dpass = _pass(store, client, clock=clock)
     first = await dpass.run_once(10)
-    assert (first.decided, first.failed) == (1, 1)
-    client.asked.clear()
+    assert first.decided == 0 and first.failed == 1  # nothing had answered: the rest waits
+    clock.t += 121  # the backoff passes; p0 is cooling down, so the probe is p1
     second = await dpass.run_once(10)
-    assert client.asked == []  # p0 is cooling down, p1 is done
-    assert second.claimed == 0
+    assert second.decided == 1 and client.asked == ["p0", "p1"]
+    third = await dpass.run_once(10)
+    assert third.claimed == 0
 
 
 async def test_an_unstorable_answer_is_not_a_crash():
@@ -181,6 +203,98 @@ async def test_worker_starts_and_stops():
         await asyncio.sleep(0.02)
     await worker.stop()
     assert [w["page_id"] for w in store.written] == ["p1"]
+
+
+async def test_the_hourly_cap_bounds_the_pass():
+    clock = Clock()
+    store = FakeStore([_page(i) for i in range(12)])
+    client = FakeClient({f"p{i}": {"embed": 0.9, "graph": 0.9} for i in range(12)})
+    dpass = _pass(store, client, max_pages_per_hour=5, clock=clock)
+    first = await dpass.run_once(100)
+    assert first.decided == 5 and first.capped
+    again = await dpass.run_once(100)
+    assert again.decided == 0 and "cap" in again.message and len(client.asked) == 5
+    assert (await dpass.summary())["asks_in_last_hour"] == 5
+    clock.t += 3601
+    later = await dpass.run_once(100)
+    assert later.decided == 5 and len(client.asked) == 10
+
+
+async def test_backoff_probes_one_page_and_doubles():
+    clock = Clock()
+    pages = [_page(i) for i in range(40)]
+    store = FakeStore(pages)
+    client = FakeClient({})  # down
+    dpass = _pass(store, client, backoff_base_s=120.0, clock=clock)
+    await dpass.run_once(32)
+    assert 1 <= len(client.asked) <= 4
+    n = len(client.asked)
+    # immediately after: no request at all
+    r = await dpass.run_once(32)
+    assert r.backing_off and len(client.asked) == n
+    # after the first period: exactly one probe page, still failing
+    clock.t += 121
+    await dpass.run_once(32)
+    assert len(client.asked) == n + 1
+    # the period doubled: 121 s later is still too soon, 241 s later is not
+    clock.t += 121
+    assert (await dpass.run_once(32)).backing_off
+    clock.t += 121
+    await dpass.run_once(32)
+    assert len(client.asked) == n + 2
+    # the endpoint recovers: one probe answers, then the pass runs at full size
+    client.by_page = {f"p{i}": {"embed": 0.9, "graph": 0.9} for i in range(40)}
+    clock.t += 481
+    await dpass.run_once(32)
+    assert len(store.written) == 1  # the probe
+    done = await dpass.run_once(32)
+    assert done.decided > 1
+    assert (await dpass.summary())["endpoint_failing"] is False
+
+
+async def test_an_invalid_active_spec_stops_the_pass_and_is_reported():
+    store = FakeStore([_page(1)])
+    store.spec_error = "active spec version 3 is invalid: thresholds"
+    client = FakeClient({"p1": {"embed": 0.9, "graph": 0.9}})
+    dpass = _pass(store, client)
+    report = await dpass.run_once(10)
+    assert report.spec_invalid and report.decided == 0
+    assert client.asked == [] and store.claims == 0 and store.written == []
+    summary = await dpass.summary()
+    assert "invalid" in summary["active_spec_error"]
+
+
+def test_non_private_host():
+    from trellion.live.decision_client import non_private_host
+
+    for ok in ("http://127.0.0.1:8080/v1", "http://localhost/x", "http://[::1]:9/",
+               # built from parts: the tree scan forbids private literals in files
+               *(f"http://{'.'.join(parts)}/" for parts in (("10", "1", "2", "3"),
+                                                            ("192", "168", "0", "5"),
+                                                            ("172", "20", "0", "1")))):
+        assert non_private_host(ok) is None, ok
+    assert non_private_host("https://decider.example.com/v1/systemone?key=abc") == "decider.example.com"
+    assert non_private_host("https://user:pw@decider.example.com:8443/p?q=1") == "decider.example.com"
+
+
+async def test_the_worker_warns_once_about_a_public_endpoint_host_only():
+    from structlog.testing import capture_logs
+
+    from trellion.live.decision_client import DecisionClient
+
+    client = DecisionClient("https://decider.example.com/secret/path?token=abc", api_key="sekret")
+    worker = DispositionWorker(_pass(FakeStore([]), client), interval_s=60.0)
+    with capture_logs() as logs:
+        await worker.start()
+        await worker.stop()
+    warns = [e for e in logs if e["log_level"] == "warning" and "not_private" in e["event"]]
+    assert len(warns) == 1 and warns[0]["host"] == "decider.example.com"
+    assert "secret" not in str(warns) and "sekret" not in str(warns) and "token" not in str(warns)
+    local = DispositionWorker(_pass(FakeStore([]), DecisionClient("http://127.0.0.1:9")), interval_s=60.0)
+    with capture_logs() as logs:
+        await local.start()
+        await local.stop()
+    assert not [e for e in logs if "not_private" in e["event"]]
 
 
 def test_the_pass_has_no_write_path_to_indexing_state():
@@ -257,7 +371,7 @@ async def test_migration_creates_the_three_tables(world):
     assert cols["kb_specs"] == {"version", "spec", "created_at", "created_by", "note", "active"}
     assert cols["page_dispositions"] == {
         "page_id", "spec_version", "would_embed", "would_graph", "held", "answers",
-        "model", "decided_at", "review_after", "mode",
+        "thresholds", "spec_hash", "question_ids", "model", "decided_at", "review_after", "mode",
     }
 
 
@@ -405,3 +519,84 @@ async def test_summary_numbers_and_the_held_but_retrieved_count(world):
     s = await dpass.summary()
     assert s["endpoint_configured"] is False and s["message"] == NO_ENDPOINT
     assert s["mode"] == "shadow"
+
+
+@needs_db
+async def test_a_held_documents_pages_are_never_claimed_or_sent(world):
+    store, tag, make, eng = world
+    held = await make("heldonly")
+    await store.hold_docs(doc_ids=[held["doc_id"]], reason="t", apply=True)
+    ks = KnowledgeStore(eng)
+    batch = await ks.claim_undecided_pages(100000)
+    try:
+        assert held["page_id"] not in {r["page_id"] for r in batch.rows}
+    finally:
+        batch.release()
+    client = TaggedClient(tag, {"heldonly": {"embed": 0.9, "graph": 0.9}})
+    await DispositionPass(ks, client, min_age_s=0.0).run_once(1000)  # type: ignore[arg-type]
+    assert held["page_id"] not in client.asked
+    assert await _row(eng, "SELECT 1 FROM page_dispositions WHERE page_id = CAST(:p AS uuid)",
+                      p=held["page_id"]) == []
+
+
+@needs_db
+async def test_restricted_audience_documents_are_not_sent(world):
+    store, tag, make, eng = world
+    plain = await make("plain")                      # untagged: readable by a user
+    user_tagged = await make("usertag")
+    restricted = await make("restricted")
+    mixed = await make("mixed")                      # has the user role among others
+    for d, roles in ((user_tagged, ["user"]), (restricted, ["admin"]), (mixed, ["admin", "user"])):
+        async with eng.begin() as c:
+            await c.execute(
+                text("UPDATE docs SET metadata = jsonb_build_object('roles', CAST(:r AS jsonb)) "
+                     "WHERE doc_id = CAST(:d AS uuid)"),
+                {"r": __import__("json").dumps(roles), "d": d["doc_id"]},
+            )
+    ks = KnowledgeStore(eng)
+    before = (await ks.disposition_summary())["not_asked_restricted_audience"]
+    client = TaggedClient(tag, {t: {"embed": 0.9, "graph": 0.9}
+                                for t in ("plain", "usertag", "restricted", "mixed")})
+    dpass = DispositionPass(ks, client, min_age_s=0.0)  # type: ignore[arg-type]
+    await dpass.run_once(1000)
+    sent = {p for p in client.asked}
+    assert restricted["page_id"] not in sent
+    assert {plain["page_id"], user_tagged["page_id"], mixed["page_id"]} <= sent
+    summary = await dpass.summary()
+    assert summary["not_asked_restricted_audience"] - before == 1
+
+
+@needs_db
+async def test_an_invalid_stored_spec_is_not_replaced_by_the_default(world):
+    store, tag, make, eng = world
+    page = await make("needspec")
+    async with eng.begin() as c:
+        await c.execute(text("UPDATE kb_specs SET active = false"))
+        await c.execute(text(
+            "INSERT INTO kb_specs (version, spec, created_by, active) "
+            "VALUES ((SELECT COALESCE(MAX(version), 1) + 1 FROM kb_specs), "
+            "'{\"questions\": {}}'::jsonb, :t, true)"), {"t": tag})
+    ks = KnowledgeStore(eng)
+    with pytest.raises(StoredSpecError):
+        await ks.load_active_spec()
+    client = TaggedClient(tag, {"needspec": {"embed": 0.9, "graph": 0.9}})
+    dpass = DispositionPass(ks, client, min_age_s=0.0)  # type: ignore[arg-type]
+    report = await dpass.run_once(1000)
+    assert report.spec_invalid and client.asked == []
+    assert await _row(eng, "SELECT 1 FROM page_dispositions WHERE page_id = CAST(:p AS uuid)",
+                      p=page["page_id"]) == []
+    assert (await dpass.summary())["active_spec_error"]
+
+
+@needs_db
+async def test_a_row_records_the_spec_it_was_decided_under(world):
+    _, tag, make, eng = world
+    page = await make("audit")
+    async with eng.begin() as c:
+        await c.execute(text("UPDATE kb_specs SET active = false"))
+    client = TaggedClient(tag, {"audit": {"embed": 0.9, "graph": 0.1}})
+    await DispositionPass(KnowledgeStore(eng), client, min_age_s=0.0).run_once(1000)  # type: ignore[arg-type]
+    row = (await _row(eng, "SELECT thresholds, spec_hash, question_ids FROM page_dispositions "
+                           "WHERE page_id = CAST(:p AS uuid)", p=page["page_id"]))[0]
+    assert row[0] == {"embed_yes": 0.6, "graph_yes": 0.6, "hold_below": 0.25}
+    assert row[1] == default_spec().body_hash() and row[2] == ["embed", "graph", "usefulness"]

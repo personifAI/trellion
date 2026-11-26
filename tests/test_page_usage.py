@@ -144,24 +144,16 @@ async def test_schedule_outside_a_running_loop_does_not_raise():
     assert not pr._USAGE_TASKS
 
 
-async def test_kill_switch(monkeypatch):
-    monkeypatch.setenv("TRELLION_PAGE_USAGE", "off")
-    store = _Store()
-    pr.schedule_usage_record(store, ["p1"])
-    await _drain()
-    assert store.calls == []
-
-
-async def test_in_flight_writes_are_capped(monkeypatch):
-    monkeypatch.setattr(pr, "_USAGE_MAX_INFLIGHT", 2)
+async def test_the_fifth_in_flight_write_is_dropped_not_queued():
+    assert pr._USAGE_MAX_INFLIGHT == 4  # the store pool is 5 + 3: leave it to retrieval
     store = _Store()
     store.release = asyncio.Event()
     for i in range(5):
         pr.schedule_usage_record(store, [f"p{i}"])
-    assert len(pr._USAGE_TASKS) == 2
+    assert len(pr._USAGE_TASKS) == 4
     store.release.set()
     await _drain()
-    assert len(store.calls) == 2
+    assert sorted(c[0] for c in store.calls) == ["p0", "p1", "p2", "p3"]  # p4 never ran, even later
 
 
 class _Embedder:

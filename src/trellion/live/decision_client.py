@@ -17,8 +17,8 @@ the feature is inert (:meth:`DecisionClient.from_env` returns None).
                                    characters, 200-50000 (default 4000).
 =================================  =========================================
 
-The page's title, source, headers and text are sent to the configured
-endpoint: point it only at a service you are content to see that text.
+The page's title, source name, headers and text are sent to the configured
+endpoint, so it must be a service you run yourself.
 A request is tried twice at most (one retry, on a timeout, a connection
 error, a 429 or a 5xx). The URL's query string, the key and the page text are
 never written to the log.
@@ -26,6 +26,7 @@ never written to the log.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit
@@ -69,6 +70,20 @@ def endpoint_url(raw: str) -> str:
     if parts.path in ("", "/"):
         return raw.strip().rstrip("/") + DEFAULT_PATH
     return raw.strip()
+
+
+def non_private_host(url: str) -> Optional[str]:
+    """The host name of ``url`` when it is neither loopback nor a private-range
+    address (a name that is not an IP literal cannot be judged, so it counts),
+    else None. Host only: never the path, query, credentials or port."""
+    host = urlsplit(url).hostname or ""
+    if not host or host == "localhost":
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    return None if (ip.is_loopback or ip.is_private or ip.is_link_local) else host
 
 
 def _kind(source_uri: Optional[str]) -> str:

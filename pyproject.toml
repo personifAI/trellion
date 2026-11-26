@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 dependencies = [
     # The interface trellion offers add-ons (Apache-2.0, its own repo). Pinned
     # by full commit SHA, never by tag alone: tags can be moved.
-    # schema revision 107 (unmerged branch feat/g55-schema-107-knowledge-disposition; move to the merge commit once it lands)
+    # schema revision 107 (knowledge disposition tables)
     "trellion-protocols @ git+https://github.com/personifAI/trellion-protocols.git@bac3d7edb11e9e83ae267f97898d57005a1278b0",
     # I/O + orchestration
     "typer>=0.12",

@@ -17,6 +17,7 @@ from typing import Any, Mapping, Optional
 
 import structlog
 from sqlalchemy import text
+from trellion_protocols.schema import ROLES_WHERE
 
 from trellion.live.knowledge_spec import (
     DEFAULT_SPEC_VERSION,
@@ -26,6 +27,15 @@ from trellion.live.knowledge_spec import (
 )
 
 log = structlog.get_logger(__name__)
+
+#: The audience this slice is willing to send to a decision endpoint: what a
+#: plain ``user`` may read (untagged documents, or tagged with ``user``).
+#: Anything narrower stays on this machine.
+GENERIC_ROLES = ["user"]
+
+
+class StoredSpecError(RuntimeError):
+    """The ACTIVE stored spec does not validate. The default must not stand in."""
 
 
 class KnowledgeStore:
@@ -43,8 +53,9 @@ class KnowledgeStore:
     async def load_active_spec(self) -> KnowledgeSpec:
         """The active spec; the built-in default (version 1) when ``kb_specs`` is empty.
 
-        A stored spec that no longer validates is not used: the default stands
-        in and the problem is logged, so a bad row cannot stop the pass.
+        Raises :class:`StoredSpecError` when the active stored spec does not
+        validate: silently substituting the default would change what the
+        operator's decisions mean.
         """
         async with self._engine.connect() as conn:
             row = (await conn.execute(text(
@@ -58,8 +69,7 @@ class KnowledgeStore:
         try:
             return KnowledgeSpec.from_dict(body, int(row[0]))
         except SpecError as exc:
-            log.warning("knowledge_spec.stored_spec_invalid", version=int(row[0]), error=str(exc))
-            return default_spec()
+            raise StoredSpecError(f"active spec version {int(row[0])} is invalid: {exc}") from exc
 
     async def save_spec(
         self,
@@ -119,12 +129,14 @@ class KnowledgeStore:
                           AND d.created_at <= now() - make_interval(secs => CAST(:min_age AS double precision))
                           AND NOT EXISTS (SELECT 1 FROM page_dispositions x
                                           WHERE x.page_id = p.page_id)
+                          AND __ROLES__
                           AND p.page_id <> ALL(CAST(:skip AS uuid[]))
                         ORDER BY p.page_id
                         LIMIT :limit
                         FOR NO KEY UPDATE OF p SKIP LOCKED
-                        """),
-                        {"limit": limit, "min_age": float(min_age_s), "skip": exclude},
+                        """.replace("__ROLES__", ROLES_WHERE)),
+                        {"limit": limit, "min_age": float(min_age_s), "skip": exclude,
+                         "roles": GENERIC_ROLES},
                     )
                     rows = []
                     for r in result.fetchall():
@@ -145,6 +157,9 @@ class KnowledgeStore:
         would_embed: bool,
         would_graph: bool,
         held: bool,
+        thresholds: Mapping[str, Any],
+        spec_hash: str,
+        question_ids: list[str],
         answers: Mapping[str, Any],
         model: Optional[str],
         review_after: Optional[datetime],
@@ -160,8 +175,10 @@ class KnowledgeStore:
                 text("""
                 INSERT INTO page_dispositions
                     (page_id, spec_version, would_embed, would_graph, held, answers,
+                     thresholds, spec_hash, question_ids,
                      model, decided_at, review_after, mode)
                 SELECT p.page_id, :ver, :we, :wg, :held, CAST(:answers AS jsonb),
+                       CAST(:thresholds AS jsonb), :spec_hash, CAST(:qids AS jsonb),
                        :model, now(), CAST(:review_after AS timestamptz), 'shadow'
                 FROM pages p
                 WHERE p.page_id = CAST(:page_id AS uuid) AND md5(p.text) = :seen
@@ -169,7 +186,9 @@ class KnowledgeStore:
                 """),
                 {"page_id": page_id, "seen": seen, "ver": spec_version,
                  "we": would_embed, "wg": would_graph, "held": held,
-                 "answers": json.dumps(answers, allow_nan=False), "model": model,
+                 "answers": json.dumps(answers, allow_nan=False),
+                 "thresholds": json.dumps(thresholds), "spec_hash": spec_hash,
+                 "qids": json.dumps(question_ids), "model": model,
                  "review_after": review_after},
             )
             return (res.rowcount or 0) > 0
@@ -229,12 +248,19 @@ class KnowledgeStore:
                 WHERE d.held_at IS NULL AND NOT EXISTS (
                     SELECT 1 FROM page_dispositions x WHERE x.page_id = p.page_id)
             """))).scalar() or 0
+            restricted = (await conn.execute(text("""
+                SELECT count(*) FROM pages p JOIN docs d ON d.doc_id = p.doc_id
+                WHERE d.held_at IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM page_dispositions x WHERE x.page_id = p.page_id)
+                  AND NOT (__ROLES__)
+            """.replace("__ROLES__", ROLES_WHERE)), {"roles": GENERIC_ROLES})).scalar() or 0
             versions = (await conn.execute(text(
                 "SELECT spec_version, count(*) FROM page_dispositions "
                 "GROUP BY spec_version ORDER BY spec_version"
             ))).fetchall()
         out: dict[str, Any] = {k: int(v or 0) for k, v in d.items()}
         out["undecided"] = int(undecided)
+        out["not_asked_restricted_audience"] = int(restricted)
         out["embed_calls_saved"] = {
             "pages": out.pop("embeds_saved_pages"),
             "chunks": int(chunks),

@@ -18,6 +18,8 @@ Slice 1 is shadow mode: a disposition is *recorded*, never acted on.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -113,6 +115,21 @@ class KnowledgeSpec:
             },
             "targets": dict(self.targets),
         }
+
+    def thresholds_dict(self) -> dict[str, float]:
+        return self.to_dict()["thresholds"]
+
+    def question_ids(self) -> list[str]:
+        return [q.id for q in self.questions]
+
+    def body_hash(self) -> str:
+        """SHA-256 of the canonical spec body (the version is not part of it).
+
+        Recorded with every disposition, so what "version 1" meant when a row
+        was written stays recoverable if the built-in default ever changes.
+        """
+        canon = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
     @classmethod
     def from_dict(cls, data: Any, version: int) -> "KnowledgeSpec":

@@ -12,7 +12,9 @@ Three new tables; no existing table changes.
   default, reported as version 1.
 - ``page_dispositions``: the disposition a decision model would give a page
   (embed it, extract entities from it, or hold it back), with the raw answers
-  as the audit record. ``mode`` is ``'shadow'``: nothing reads these rows to
+  as the audit record, plus the thresholds in force, a hash of the spec body
+  used and the question ids, so a row explains itself even after the built-in
+  default changes. ``mode`` is ``'shadow'``: nothing reads these rows to
   change what is embedded or extracted.
 
 Idempotent (IF NOT EXISTS); additive, so an old reader and an old writer keep
@@ -63,6 +65,9 @@ def upgrade() -> None:
         "would_graph boolean NOT NULL, "
         "held boolean NOT NULL, "
         "answers jsonb NOT NULL, "
+        "thresholds jsonb NOT NULL, "
+        "spec_hash text NOT NULL, "
+        "question_ids jsonb NOT NULL, "
         "model text, "
         "decided_at timestamp with time zone NOT NULL DEFAULT now(), "
         "review_after timestamp with time zone, "

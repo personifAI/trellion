@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -51,15 +50,13 @@ _POOL_FACTOR = 4
 
 # Page-usage recording (migration 107). One fire-and-forget task per retrieve
 # call, kept alive here until it finishes (the event loop holds only a weak
-# reference to a task). At most _USAGE_MAX_INFLIGHT run at once: past that a
-# slow database costs a dropped count, never queued work.
+# reference to a task). At most _USAGE_MAX_INFLIGHT run at once; past that the
+# count is DROPPED, not queued. Each task holds a pool connection while it
+# writes, and the store's pool is small (5 + 3 overflow): a long line of
+# waiting usage writes could sit in front of retrieval's own checkouts. Four
+# leaves the rest of the pool to retrieval, and a missed count costs nothing.
 _USAGE_TASKS: set = set()
-_USAGE_MAX_INFLIGHT = 64
-_USAGE_OFF_VALUES = ("off", "0", "false", "no")
-
-
-def _usage_enabled() -> bool:
-    return os.environ.get("TRELLION_PAGE_USAGE", "on").strip().lower() not in _USAGE_OFF_VALUES
+_USAGE_MAX_INFLIGHT = 4
 
 
 async def _record_usage(store, page_ids: list[str]) -> None:
@@ -74,7 +71,7 @@ def schedule_usage_record(store, page_ids: list[str]) -> None:
     """Count these pages as retrieved, off the request path. Never raises."""
     try:
         page_ids = [i for i in page_ids if isinstance(i, str) and i]
-        if not page_ids or not _usage_enabled() or len(_USAGE_TASKS) >= _USAGE_MAX_INFLIGHT:
+        if not page_ids or len(_USAGE_TASKS) >= _USAGE_MAX_INFLIGHT:
             return
         record = getattr(store, "record_page_usage", None)
         if record is None:
