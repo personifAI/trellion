@@ -141,6 +141,43 @@ the same `check_entity`.
   `POST /api/v1/graph/entity-cleanup` (admin only, dry run unless `apply` is the
   boolean `true`) and the gateway's scheduled `entity_cleanup` action.
 
+## Knowledge disposition, shadow mode (`knowledge_spec.py`, `knowledge_disposition.py`)
+
+This slice records; it changes nothing about what is embedded, extracted or
+returned.
+
+* **Page usage.** After `retrieve` builds its result, one fire-and-forget
+  statement upserts `page_usage` (`retrieved_count`, first and last time) for
+  the pages it returned, deduplicated per call. It runs off the request path,
+  its failures are logged at debug level only, and at most 64 are in flight at
+  once (more are dropped, not queued). `TRELLION_PAGE_USAGE=off` turns it off.
+* **Spec.** A versioned declarative spec (`kb_specs`, at most one active):
+  the questions put to a decision model (`embed` and `graph` are yes/no
+  questions, `usefulness` is a five-level score), the probability thresholds
+  that turn answers into a disposition, the review period for held pages, and
+  named `targets` (recorded, not enforced). With no stored spec the built-in
+  default is used and reported as version 1. The default says: a page is
+  embedded when P(embed) is at least 0.60 and graphed when P(graph) is at least
+  0.60; a page that is neither is held; a held page with a probability between
+  0.25 and 0.60 is in the band and is re-examined after 14 days, any other held
+  page after 90.
+* **Decision endpoint.** A decision model speaking the SystemOne wire format
+  (`POST /v1/systemone` with `state` and `questions`, answers carrying
+  probabilities; for example Clef-Flash) is asked the spec's questions about
+  each page. It generates no text. With `TRELLION_DECISION_URL` unset the
+  feature does nothing.
+* **Disposition pass.** A background loop, started with the other backlog
+  loops when an endpoint is configured, claims pages that have no decision yet
+  (documents not held, and older than `TRELLION_DECISION_MIN_AGE_S`), asks the
+  endpoint, applies the spec and writes `page_dispositions` with `mode =
+  'shadow'` and the raw answers (probabilities included) as the audit record.
+  A page with a missing or malformed answer gets no record and is retried
+  later. The pass only reads `pages`, embeddings and extraction state.
+  `DispositionPass.summary()` reports the counts by would-be state, the embed
+  and extraction calls enforcing would have saved, and how many pages it would
+  have held that retrieval actually returned (the number to read before
+  enforcing anything).
+
 ## Video memory (`video/`, `recall/`)
 
 Episodic ("System 1") memory of proven graph walks and conversation frames.

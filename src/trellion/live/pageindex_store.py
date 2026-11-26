@@ -417,6 +417,36 @@ class PageIndexStore:
             raise ValueError("doc_ids must not be empty")
         return "doc_id = ANY(CAST(:ids AS uuid[]))", {"ids": list(doc_ids)}
 
+    # ------------------------------------------------------------------
+    # Page usage (migration 107)
+    # ------------------------------------------------------------------
+
+    async def record_page_usage(self, page_ids: list[str]) -> int:
+        """Count one retrieval for each distinct page in ``page_ids``.
+
+        ONE statement however many pages: an upsert into ``page_usage`` that
+        selects from ``pages``, so a page deleted since retrieval is skipped
+        instead of failing the batch. Ids are sorted so two concurrent calls
+        take their row locks in the same order. Returns the pages counted.
+        """
+        ids = sorted({str(i) for i in page_ids if i})
+        if not ids:
+            return 0
+        async with self._engine.begin() as conn:
+            result = await conn.execute(
+                text("""
+                INSERT INTO page_usage (page_id, retrieved_count)
+                SELECT p.page_id, 1 FROM pages p
+                WHERE p.page_id = ANY(CAST(:ids AS uuid[]))
+                ORDER BY p.page_id
+                ON CONFLICT (page_id) DO UPDATE SET
+                    retrieved_count = page_usage.retrieved_count + 1,
+                    last_retrieved_at = now()
+                """),
+                {"ids": ids},
+            )
+            return result.rowcount or 0
+
     async def hold_docs(
         self,
         title_prefix: Optional[str] = None,

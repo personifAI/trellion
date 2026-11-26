@@ -13,7 +13,9 @@ Retrieval strategy:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -46,6 +48,41 @@ _QUERY_EMBED_CACHE_MAX = 1000
 # Candidate pages fetched per answer slot. Was 2: with one topic filling
 # the first ten, no other topic was there for the diversity cap to pick.
 _POOL_FACTOR = 4
+
+# Page-usage recording (migration 107). One fire-and-forget task per retrieve
+# call, kept alive here until it finishes (the event loop holds only a weak
+# reference to a task). At most _USAGE_MAX_INFLIGHT run at once: past that a
+# slow database costs a dropped count, never queued work.
+_USAGE_TASKS: set = set()
+_USAGE_MAX_INFLIGHT = 64
+_USAGE_OFF_VALUES = ("off", "0", "false", "no")
+
+
+def _usage_enabled() -> bool:
+    return os.environ.get("TRELLION_PAGE_USAGE", "on").strip().lower() not in _USAGE_OFF_VALUES
+
+
+async def _record_usage(store, page_ids: list[str]) -> None:
+    try:
+        await store.record_page_usage(page_ids)
+    except Exception as exc:
+        # Debug only, no traceback: a usage count is not worth a log line per prompt.
+        log.debug("retriever.usage_record_failed", error=type(exc).__name__)
+
+
+def schedule_usage_record(store, page_ids: list[str]) -> None:
+    """Count these pages as retrieved, off the request path. Never raises."""
+    try:
+        if not page_ids or not _usage_enabled() or len(_USAGE_TASKS) >= _USAGE_MAX_INFLIGHT:
+            return
+        record = getattr(store, "record_page_usage", None)
+        if record is None:
+            return
+        task = asyncio.get_running_loop().create_task(_record_usage(store, list(dict.fromkeys(page_ids))))
+        _USAGE_TASKS.add(task)
+        task.add_done_callback(_USAGE_TASKS.discard)
+    except Exception as exc:
+        log.debug("retriever.usage_schedule_failed", error=type(exc).__name__)
 
 
 @dataclass
@@ -266,6 +303,7 @@ class PageIndexRetriever:
 
         # Step 4: Build evidence packs
         evidence = await self.build_evidence(pages, chunks)
+        schedule_usage_record(self.store, [e.page_id for e in evidence])
         return evidence
 
     async def retrieve_pages(
